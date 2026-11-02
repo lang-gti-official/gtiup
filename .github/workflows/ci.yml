@@ -1,0 +1,112 @@
+name: gtiup CI and releases
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: gtiup-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: darwin-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          version=re.search(r'project\(gtiup VERSION ([0-9.]+)',Path('CMakeLists.txt').read_text()).group(1)
+          assert os.environ['RELEASE_TAG']=='v'+version, 'Tag must match CMake project version'
+          PY
+      - name: Build and test static Linux manager
+        if: matrix.platform == 'linux-x64'
+        run: docker run --rm -v "$PWD:/work" -w /work alpine:3.23 sh scripts/linux-static.sh
+      - name: Build and test macOS manager
+        if: matrix.platform == 'darwin-arm64'
+        run: |
+          test "$(uname -m)" = arm64
+          cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-mac --target gtiup gtiup-test --parallel 4
+          ctest --test-dir build-mac --output-on-failure
+          otool -L build-mac/gtiup > /tmp/gtiup-libraries.txt
+          cat /tmp/gtiup-libraries.txt
+          if grep -E '/opt/homebrew|/usr/local|/Users/' /tmp/gtiup-libraries.txt; then exit 1; fi
+          python3 scripts/package.py --build build-mac --platform darwin-arm64
+      - name: Installer syntax
+        run: sh -n install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gtiup-${{ matrix.platform }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+  sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev ninja-build
+      - run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGTIUP_SANITIZERS=ON
+          cmake --build build --target gtiup gtiup-test --parallel 4
+          ctest --test-dir build --output-on-failure
+  gate:
+    name: gtiup gate
+    needs: [native, sanitizer]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          NATIVE: ${{ needs.native.result }}
+          SANITIZER: ${{ needs.sanitizer.result }}
+        run: test "$NATIVE" = success && test "$SANITIZER" = success
+  publish:
+    needs: [gate]
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'lang-gti-official/gtiup'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gtiup-*-${{ github.sha }}
+          path: dist
+          merge-multiple: true
+      - name: Verify exact platform inventory
+        run: |
+          test -f dist/gtiup-linux-x64
+          test -f dist/gtiup-darwin-arm64
+          cd dist
+          sha256sum --check ./*.sha256
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/gtiup-*
+      - name: Publish immutable manager release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to replace it'; exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "gtiup $RELEASE_TAG" --notes 'Standalone C++ GTI toolchain manager for preview, nightly, beta and stable. No Python or GTI compiler required. See the repository README for installation and checksums.'
