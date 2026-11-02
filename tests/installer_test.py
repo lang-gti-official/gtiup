@@ -39,9 +39,11 @@ else: dest.write_bytes(payload)
 ''')
         curl.chmod(0o755)
         self.env={**os.environ,'PATH':str(self.bin)+os.pathsep+os.environ['PATH'],
-                  'GTIUP_HOME':str(self.root/'home with spaces'), 'TEST_PAYLOAD':str(self.payload),
+                  'HOME':str(self.root/'user'), 'SHELL':'/bin/zsh', 'GTIUP_HOME':str(self.root/"home with spaces and 'quotes' $dollars"), 'TEST_PAYLOAD':str(self.payload),
                   'TEST_CALLED':str(self.called),'TEST_URLS':str(self.urls)}
         self.env.pop('GTIUP_VERSION',None)
+        self.env.pop('ZDOTDIR',None)
+        Path(self.env['HOME']).mkdir()
 
     def run_install(self,*args,ok=True,**extra):
         p=subprocess.run(['sh',str(INSTALLER),*args],env={**self.env,**extra},capture_output=True,text=True,timeout=15)
@@ -55,9 +57,51 @@ else: dest.write_bytes(payload)
         self.assertEqual((Path(self.env['GTIUP_HOME'])/'share/gtiup/licenses.txt').read_text(),'fixture license')
 
     def test_pinned_manager_and_manager_only(self):
-        self.run_install(GTIUP_VERSION='v0.1.0')
-        self.assertEqual(self.called.read_text().splitlines(),['self-install'])
+        self.run_install('--default-toolchain','none',GTIUP_VERSION='v0.1.0')
+        self.assertEqual(self.called.read_text().splitlines(),['self-install','--default-toolchain','none'])
         self.assertTrue(all('/releases/download/v0.1.0/' in x for x in self.urls.read_text().splitlines()))
+
+    def test_one_command_installs_nightly_and_sets_path(self):
+        self.run_install()
+        self.assertEqual(self.called.read_text().splitlines(),['self-install','--default-toolchain','nightly'])
+        profile=Path(self.env['HOME'])/'.zshenv'
+        contents=profile.read_text()
+        self.run_install()
+        self.assertEqual(profile.read_text(),contents)
+        result=subprocess.run(['sh','-c','. "$HOME/.zshenv"; . "$HOME/.zshenv"; printf "%s\\n%s" "$GTIUP_HOME" "$PATH"'],env=self.env,capture_output=True,text=True,check=True)
+        home,path=result.stdout.split('\n',1)
+        self.assertEqual(home,str(Path(self.env['GTIUP_HOME']).resolve()))
+        self.assertEqual(path.split(os.pathsep).count(home+'/bin'),1)
+        self.assertEqual(path.split(os.pathsep)[0],home+'/bin')
+
+    def test_preserves_profiles_and_honors_opt_out(self):
+        profile=Path(self.env['HOME'])/'.bash_profile'
+        profile.write_text('# existing settings\nexport EDITOR=vim\n')
+        self.run_install(SHELL='/bin/bash')
+        self.assertTrue(profile.read_text().startswith('# existing settings\nexport EDITOR=vim\n'))
+        before=profile.read_text()
+        self.run_install('--no-modify-path',SHELL='/bin/bash')
+        self.assertEqual(profile.read_text(),before)
+
+    def test_fresh_opt_out_and_failure_do_not_modify_shell(self):
+        self.run_install('--no-modify-path')
+        self.assertFalse((Path(self.env['HOME'])/'.profile').exists())
+        self.payload.write_text('#!/bin/sh\nexit 7\n')
+        self.run_install(ok=False)
+        self.assertFalse((Path(self.env['HOME'])/'.profile').exists())
+
+    def test_preserves_unrelated_environment_file(self):
+        home=Path(self.env['GTIUP_HOME']); home.mkdir()
+        (home/'env').write_text('# custom environment\n')
+        self.run_install(ok=False)
+        self.assertEqual((home/'env').read_text(),'# custom environment\n')
+        self.assertFalse((Path(self.env['HOME'])/'.profile').exists())
+
+    def test_zdotdir_is_respected(self):
+        directory=self.root/'zsh config'
+        self.run_install(ZDOTDIR=str(directory))
+        self.assertTrue((directory/'.zshenv').is_file())
+        self.assertFalse((Path(self.env['HOME'])/'.zshenv').exists())
 
     def test_bad_checksum_never_executes(self):
         self.run_install(ok=False,TEST_BAD_HASH='1')
