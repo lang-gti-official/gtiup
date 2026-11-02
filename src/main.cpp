@@ -2,6 +2,7 @@
 #include <archive_entry.h>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <toml.hpp>
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/dyld.h>
@@ -69,6 +70,41 @@ std::string selection(const std::string &s) {
   return s[0] == 'v' ? s : "v" + s;
 }
 bool rolling(const std::string &s) { return s == "preview" || s == "nightly"; }
+std::string project_selection(const fs::path &path, bool legacy) {
+  try {
+    const auto contents = read(path, 64 * 1024);
+    if (legacy) {
+      // Keep the original one-line format, and accept TOML in either filename.
+      const auto name = trim(contents);
+      if (name == "preview" || name == "nightly" || name == "beta" ||
+          name == "stable" || std::regex_match(name, version_pattern))
+        return selection(name);
+    }
+    const auto document = toml::parse(contents);
+    for (const auto &[key, value] : document) {
+      (void)value;
+      if (key.str() != "toolchain")
+        throw Error("unsupported top-level key: " + std::string(key.str()));
+    }
+    const auto *toolchain = document["toolchain"].as_table();
+    if (!toolchain)
+      throw Error("expected a [toolchain] table with a string channel");
+    for (const auto &[key, value] : *toolchain) {
+      (void)value;
+      if (key.str() != "channel")
+        throw Error("unsupported toolchain setting: " + std::string(key.str()));
+    }
+    const auto channel = (*toolchain)["channel"].value<std::string>();
+    if (!channel)
+      throw Error("toolchain.channel must be a string");
+    return selection(*channel);
+  } catch (const toml::parse_error &error) {
+    throw Error(path.string() + ": invalid TOML: " +
+                std::string(error.description()));
+  } catch (const std::exception &error) {
+    throw Error(path.string() + ": " + error.what());
+  }
+}
 std::array<unsigned long long, 4> version_key(const std::string &s) {
   std::smatch m;
   if (!std::regex_match(s, m, version_pattern))
@@ -520,7 +556,9 @@ struct Manager {
       return selection(override);
     for (auto p = fs::current_path();; p = p.parent_path()) {
       if (fs::exists(p / "gti-toolchain"))
-        return selection(trim(read(p / "gti-toolchain", 256)));
+        return project_selection(p / "gti-toolchain", true);
+      if (fs::exists(p / "gti-toolchain.toml"))
+        return project_selection(p / "gti-toolchain.toml", false);
       if (p == p.root_path())
         break;
     }
@@ -683,7 +721,7 @@ void help() {
             << "  list | show | which gti|gti_lsp | gc\n"
             << "  run CHANNEL gti|gti_lsp [ARGS...]\n"
             << "Channels: preview, nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N\n"
-            << "Project selection: nearest gti-toolchain file; override: "
+            << "Project selection: nearest gti-toolchain or gti-toolchain.toml; override: "
                "GTIUP_TOOLCHAIN or gti +CHANNEL\n";
 }
 int main(int argc, char **argv) {

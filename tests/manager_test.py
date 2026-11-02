@@ -104,7 +104,73 @@ class Manager(unittest.TestCase):
         self.assertIn('preview', self.run_cli('show').stdout)
         self.assertEqual(before, len(self.requests))
         (self.cwd / 'gti-toolchain').write_text('nonsense')
-        self.assertIn('expected preview', self.run_cli('which', 'gti', ok=False).stderr)
+        self.assertIn('gti-toolchain: invalid TOML', self.run_cli('which', 'gti', ok=False).stderr)
+
+    def test_toml_channels_and_versions(self):
+        for tag in ('preview', 'nightly', 'v0.2.0', 'v0.3.0-beta.2'): self.package(tag)
+        for channel in ('preview', 'nightly', 'beta', 'stable', '0.2.0', 'v0.3.0-beta.2'):
+            self.run_cli('install', channel)
+            (self.cwd / 'gti-toolchain.toml').write_text(f'# Project pin\n[toolchain]\nchannel = "{channel}" # comment\n')
+            expected = 'v0.2.0' if channel == '0.2.0' else channel
+            self.assertEqual(self.run_cli('show').stdout.splitlines()[0], expected)
+
+    def test_toml_precedence_and_proxies(self):
+        for tag in ('preview', 'nightly'): self.package(tag); self.run_cli('install', tag)
+        self.run_cli('default', 'nightly'); self.run_cli('self-install')
+        (self.cwd / 'gti-toolchain').write_text('nightly\n')
+        child = self.cwd / 'child'; child.mkdir()
+        nested = child / 'nested'; nested.mkdir()
+        config = child / 'gti-toolchain.toml'
+        config.write_text("[toolchain]\r\nchannel = 'preview'\r\n")
+        before = len(self.requests)
+        for tool in ('gti', 'gti_lsp'):
+            self.assertIn('preview-', self.run_cli('which', tool, cwd=nested).stdout)
+            self.assertIn('nightly-', self.run_cli('which', tool, cwd=nested, env={**self.env, 'GTIUP_TOOLCHAIN': 'nightly'}).stdout)
+            result = self.run_cli('argument with spaces', binary=str(self.home / 'bin' / tool), cwd=nested)
+            self.assertIn('<argument with spaces>', result.stdout)
+        # Legacy filename takes priority in the same directory, even over bad TOML.
+        (child / 'gti-toolchain').write_text('nightly\n')
+        config.write_text('invalid')
+        self.assertEqual(self.run_cli('show', cwd=nested).stdout.splitlines()[0], 'nightly')
+        (child / 'gti-toolchain').write_text('[toolchain]\nchannel = "preview"\n')
+        self.assertEqual(self.run_cli('show', cwd=nested).stdout.splitlines()[0], 'preview')
+        (child / 'gti-toolchain').unlink()
+        # Explicit selections bypass a broken project configuration.
+        self.run_cli('+nightly', '--version', binary=str(self.home / 'bin/gti'), cwd=nested)
+        self.run_cli('run', 'nightly', 'gti_lsp', '--version', cwd=nested)
+        self.run_cli('show', cwd=nested, env={**self.env, 'GTIUP_TOOLCHAIN': 'nightly'})
+        self.assertEqual(before, len(self.requests))
+
+    def test_toml_syntax_and_invalid_files_fail_closed(self):
+        self.package(); self.run_cli('default', 'nightly')
+        config = self.cwd / 'gti-toolchain.toml'
+        for text in ('toolchain.channel = "nightly"', 'toolchain = { channel = "nightly" }',
+                     '["toolchain"]\n"channel" = "night\\u006cy"'):
+            config.write_text(text)
+            self.assertEqual(self.run_cli('show').stdout.splitlines()[0], 'nightly')
+        before = len(self.requests)
+        invalid = ('', 'nightly', '[toolchain]', 'channel = "nightly"',
+                   '[toolchain]\nchannel = 1', '[toolchain]\nchannel = ["nightly"]',
+                   '[toolchain]\nchannel = "nonsense"', '[toolchain]\nchannel = " nightly "',
+                   '[toolchain]\nchannel = "nightly"\nchannel = "preview"',
+                   '[toolchain]\nchannel = "nightly', '[toolchain]\nchannel = "nightly" trailing',
+                   '[[toolchain]]\nchannel = "nightly"', '[other]\nchannel = "nightly"',
+                   '[toolchain]\nchannel = "nightly"\n[extra]',
+                   '[toolchain]\nchannel = "nightly"\nchanell = "preview"',
+                   '#' * (64 * 1024 + 1))
+        for text in invalid:
+            with self.subTest(text=text[:80]):
+                config.write_text(text)
+                self.assertIn(str(config), self.run_cli('show', ok=False).stderr)
+        for field in ('components', 'targets', 'profile', 'path'):
+            config.write_text(f'[toolchain]\nchannel = "nightly"\n{field} = "value"')
+            self.assertIn('unsupported toolchain setting: ' + field, self.run_cli('show', ok=False).stderr)
+        config.write_text('[toolchain]\nchannel = "preview"')
+        self.assertIn('preview is not installed', self.run_cli('show', ok=False).stderr)
+        # A broken legacy file must not fall through to the valid TOML sibling.
+        (self.cwd / 'gti-toolchain').write_text('broken')
+        self.assertIn('gti-toolchain: invalid TOML', self.run_cli('show', ok=False).stderr)
+        self.assertEqual(before, len(self.requests))
 
     def test_update_failure_keeps_previous_selection(self):
         self.package(); self.run_cli('default', 'nightly'); before = self.state()

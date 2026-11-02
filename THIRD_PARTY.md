@@ -1,6 +1,7 @@
 # Third-party software
 
 Builds pin and verify SHA256 checksums of nlohmann/json 3.12.0 (MIT),
+toml++ 3.4.0 (MIT),
 libarchive 3.8.11 (BSD and permissive component licenses), and, on Linux,
 curl 8.23.0 (curl license). Linux static builds also link Alpine's OpenSSL
 (Apache-2.0), zlib (zlib license), musl (MIT and permissive component licenses),
@@ -9,6 +10,7 @@ CommonCrypto, zlib and C++ runtime.
 
 Each release includes combined upstream license texts in `LICENSES.txt` inside
 the archive and in a separate platform `.licenses.txt` download.
-Source: https://github.com/nlohmann/json, https://github.com/libarchive/libarchive,
+Source: https://github.com/nlohmann/json, https://github.com/marzer/tomlplusplus,
+https://github.com/libarchive/libarchive,
 https://curl.se, https://openssl.org, https://zlib.net,
 https://musl.libc.org, https://gcc.gnu.org.

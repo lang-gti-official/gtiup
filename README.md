@@ -72,14 +72,30 @@ Versions above illustrate syntax, not a promise that those releases exist.
 Channels that have not been published fail clearly. A yanked stable or withdrawn
 beta is refused; the manager never silently substitutes another release.
 
-Put a channel or pinned version on one line in a project's `gti-toolchain` file:
+With gtiup 0.2.0 or later, put a `gti-toolchain.toml` file in your project:
+
+```toml
+[toolchain]
+channel = "nightly"
+```
+
+`channel` accepts `preview`, `nightly`, `beta`, `stable`, or a published pinned
+version such as `0.3.0-beta.2`. Comments and standard TOML string syntax work.
+Only `toolchain.channel` is supported: settings such as Rustup's `components`,
+`targets`, `profile`, or `path` are rejected rather than silently ignored.
+
+The plain-text `gti-toolchain` file remains supported:
 
 ```text
 nightly
 ```
 
 Precedence is explicit `+channel`/`gtiup run`, then `GTIUP_TOOLCHAIN`, then the
-nearest ancestor `gti-toolchain`, then the configured default. `gti` and `gti_lsp`
+nearest ancestor containing either file, then the configured default. If both
+files exist in the same directory, `gti-toolchain` wins for compatibility with
+Rustup's rule. That filename also accepts TOML; `gti-toolchain.toml` requires TOML.
+Invalid project files produce an error instead of falling back to a parent or
+the default. `gti` and `gti_lsp`
 in `~/.gtiup/bin` are manager proxies which execute the selected real binary
 with its original resource location. Selection never downloads implicitly.
 The compiler itself does not call gtiup.
