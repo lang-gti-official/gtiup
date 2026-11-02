@@ -14,7 +14,7 @@ import tempfile
 import threading
 import unittest
 
-TEST, PRODUCTION = map(lambda p: str(Path(p).resolve()), sys.argv[1:3])
+TEST, PRODUCTION, UPDATE = map(lambda p: str(Path(p).resolve()), sys.argv[1:4])
 sys.argv[1:] = []
 HOST = 'darwin-arm64' if sys.platform == 'darwin' else 'linux-x64'
 SHA = 'a' * 40
@@ -37,7 +37,9 @@ class Manager(unittest.TestCase):
                 if value is None:
                     self.send_error(404); return
                 data = json.dumps(value).encode() if isinstance(value, (dict, list)) else value
-                self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+                declared = None
+                if isinstance(data, tuple): data, declared = data
+                self.send_response(200); self.send_header('Content-Length', str(len(data) if declared is None else declared)); self.end_headers(); self.wfile.write(data)
             def log_message(self, *args): pass
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
@@ -244,6 +246,130 @@ class Manager(unittest.TestCase):
         self.run_cli('which','gti',ok=False)
         self.assertEqual(self.requests, [])
 
+    def manager_release(self, tag='v99.0.0', body=None):
+        self.routes['/manager-api/releases/latest'] = {'tag_name': tag, 'draft': False, 'prerelease': False}
+        base = '/manager-downloads/' + tag + '/gtiup-' + HOST
+        body = Path(UPDATE).read_bytes() if body is None else body
+        self.routes[base] = body
+        self.routes[base + '.sha256'] = (hashlib.sha256(body).hexdigest() + '  gtiup-' + HOST + '\n').encode()
+        self.routes[base + '.licenses.txt'] = b'Updated manager license notice\n'
+        return base
+
+    def installed_manager(self):
+        self.run_cli('self-install')
+        return str(self.home / 'bin/gtiup')
+
+    def manager_snapshot(self):
+        files = ('bin/gtiup', 'manager.json', 'settings.json', 'share/gtiup/licenses.txt', 'env')
+        return {name: (self.home / name).read_bytes() if (self.home / name).exists() else None for name in files}
+
+    def test_self_update_preserves_toolchains_proxies_and_settings(self):
+        self.package('preview'); self.run_cli('default', 'preview')
+        binary = self.installed_manager()
+        (self.home / 'env').write_text('user shell settings')
+        before = self.manager_snapshot()
+        base = self.manager_release()
+        result = self.run_cli('self', 'update', binary=binary)
+        self.assertIn('-> 99.0.0', result.stdout)
+        self.assertEqual(self.run_cli('--version', binary=binary).stdout.strip(), 'gtiup 99.0.0')
+        after = self.manager_snapshot()
+        self.assertEqual(after['settings.json'], before['settings.json'])
+        self.assertEqual(after['env'], before['env'])
+        self.assertEqual(after['bin/gtiup'], Path(UPDATE).read_bytes())
+        metadata = json.loads(after['manager.json'])
+        self.assertEqual(metadata['version'], '99.0.0')
+        self.assertEqual(metadata['sha256'], hashlib.sha256(after['bin/gtiup']).hexdigest())
+        self.assertEqual(after['share/gtiup/licenses.txt'], self.routes[base + '.licenses.txt'])
+        for tool in ('gti', 'gti_lsp'):
+            proxy = self.home / 'bin' / tool
+            self.assertEqual(os.readlink(proxy), 'gtiup')
+            self.run_cli('--version', binary=str(proxy))
+        requests = len(self.requests)
+        self.assertIn('already up to date', self.run_cli('self', 'update', binary=binary).stdout)
+        self.assertEqual(self.requests[requests:], ['/manager-api/releases/latest'])
+        self.assertEqual(after, self.manager_snapshot())
+        self.assertFalse(list((self.home / 'bin').glob('.gtiup-*')))
+
+    def test_self_update_rejects_bad_downloads_without_replacement(self):
+        binary = self.installed_manager(); before = self.manager_snapshot()
+        cases = ('checksum', 'filename', 'missing', 'interrupted', 'version', 'executable', 'license', 'timeout', 'output')
+        for case in cases:
+            with self.subTest(case=case):
+                base = self.manager_release()
+                if case == 'checksum': self.routes[base] = b'corrupt download'
+                if case == 'filename': self.routes[base + '.sha256'] = (('0' * 64) + '  other-binary\n').encode()
+                if case == 'missing': del self.routes[base]
+                if case == 'interrupted': self.routes[base] = (b'partial', 100)
+                if case == 'version': self.manager_release(body=Path(TEST).read_bytes())
+                if case == 'executable': self.manager_release(body=b'not an executable')
+                if case == 'license': del self.routes[base + '.licenses.txt']
+                if case == 'timeout': self.manager_release(body=b'#!/bin/sh\nexec sleep 10\n')
+                if case == 'output': self.manager_release(body=b'#!/bin/sh\nwhile :; do echo excessive-output; done\n')
+                self.run_cli('self', 'update', binary=binary, ok=False)
+                self.assertEqual(before, self.manager_snapshot())
+                self.run_cli('--version', binary=binary)
+                self.assertFalse(list((self.home / 'bin').glob('.gtiup-*')))
+
+    def test_self_update_rollback_after_each_replacement(self):
+        binary = self.installed_manager(); self.manager_release()
+        license = self.home / 'share/gtiup/licenses.txt'; license.parent.mkdir(parents=True)
+        for previous_license in (None, b'Original licenses\n'):
+            if previous_license is None: license.unlink(missing_ok=True)
+            else: license.write_bytes(previous_license)
+            before = self.manager_snapshot()
+            for step in ('binary', 'metadata', 'licenses'):
+                result = self.run_cli('self', 'update', binary=binary, ok=False,
+                                      env={**self.env, 'GTIUP_TEST_UPDATE_FAILURE': step})
+                self.assertIn('injected manager update failure', result.stderr)
+                self.assertEqual(before, self.manager_snapshot())
+                self.run_cli('--version', binary=binary)
+
+    def test_self_update_release_admission_and_no_downgrade(self):
+        binary = self.installed_manager(); before = self.manager_snapshot()
+        current = self.run_cli('--version').stdout.strip().split()[-1]
+        for tag in ('v' + current, 'v0.0.1'):
+            self.manager_release(tag=tag); start = len(self.requests)
+            self.assertIn('already up to date', self.run_cli('self', 'update', binary=binary).stdout)
+            self.assertEqual(self.requests[start:], ['/manager-api/releases/latest'])
+        for field, value in (('tag_name', '../bad'), ('tag_name', 'v99.0.0-beta.1'),
+                             ('draft', True), ('prerelease', True)):
+            self.manager_release(); self.routes['/manager-api/releases/latest'][field] = value
+            self.assertIn('invalid stable manager release', self.run_cli('self', 'update', binary=binary, ok=False).stderr)
+            self.assertEqual(before, self.manager_snapshot())
+        self.routes['/manager-api/releases/latest'] = {}
+        self.run_cli('self', 'update', binary=binary, ok=False)
+        self.assertEqual(before, self.manager_snapshot())
+
+    def test_self_update_requires_owned_installation(self):
+        self.run_cli('self', 'update', ok=False)
+        self.assertEqual(self.requests, [])
+        binary = self.installed_manager(); self.manager_release()
+        metadata = self.home / 'manager.json'
+        original = metadata.read_bytes()
+        changed = json.loads(original); changed['sha256'] = '0' * 64
+        metadata.write_text(json.dumps(changed))
+        self.assertIn('not the recorded manager', self.run_cli('self', 'update', binary=binary, ok=False).stderr)
+        metadata.write_bytes(original)
+        license = self.home / 'share/gtiup/licenses.txt'; license.parent.mkdir(parents=True)
+        unrelated = self.root / 'user-license'; unrelated.write_text('user content')
+        license.symlink_to(unrelated)
+        self.assertIn('license path', self.run_cli('self', 'update', binary=binary, ok=False).stderr)
+        self.assertEqual(unrelated.read_text(), 'user content')
+        self.assertEqual(Path(binary).read_bytes(), Path(TEST).read_bytes())
+        for arguments in (('self',), ('self', 'update', 'nightly'), ('self', 'other')):
+            self.assertIn('usage: gtiup self update', self.run_cli(*arguments, binary=binary, ok=False).stderr)
+
+    def test_concurrent_self_updates_install_once(self):
+        binary = self.installed_manager(); base = self.manager_release()
+        processes = [subprocess.Popen([binary, 'self', 'update'], cwd=self.cwd, env=self.env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(self.requests.count(base), 1)
+        self.assertEqual(self.run_cli('--version', binary=binary).stdout.strip(), 'gtiup 99.0.0')
+        self.assertEqual(json.loads((self.home / 'manager.json').read_text())['sha256'], hashlib.sha256(Path(binary).read_bytes()).hexdigest())
+
     def test_retention_and_explicit_gc(self):
         self.package(); self.run_cli('default','nightly'); old = self.run_cli('which','gti').stdout.strip()
         self.package(identity=SHA,extra=[(tarfile.TarInfo('another'),None)]); self.run_cli('update','nightly')
@@ -266,6 +392,7 @@ class Manager(unittest.TestCase):
         self.run_cli('install','../invalid',binary=PRODUCTION,ok=False)
         self.assertEqual(self.requests,[])
         self.assertNotIn(b'GTIUP_TEST_SERVER',Path(PRODUCTION).read_bytes())
+        self.assertNotIn(b'GTIUP_TEST_UPDATE_FAILURE',Path(PRODUCTION).read_bytes())
         self.assertNotIn(b'http://127.0.0.1:',Path(PRODUCTION).read_bytes())
 
 

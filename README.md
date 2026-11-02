@@ -51,6 +51,37 @@ The installer needs `curl` and `sha256sum` or `shasum`. The installed native
 manager performs HTTPS and archive extraction itself; it does not shell out to
 Python, curl, tar or a compiler.
 
+## Update gtiup
+
+With gtiup 0.3.0 or later, update the installed manager without running the
+installer again:
+
+```sh
+gtiup self update
+```
+
+This downloads the latest stable **gtiup** release for your platform, verifies
+its SHA256 and reported version, and atomically replaces the managed executable.
+Installed compiler toolchains, the default selection, project files, proxies,
+and shell configuration are preserved. `gtiup update nightly` remains a separate
+compiler-toolchain update. An equal or older manager release is a no-op; failed
+downloads and validation leave the current manager in place. Replacement errors
+restore the previous executable, manager metadata and license notice.
+
+The command requires the installed `GTIUP_HOME/bin/gtiup` (normally
+`~/.gtiup/bin/gtiup`), not an unmanaged download or a package-manager-owned copy.
+It uses the official `lang-gti-official/gtiup` releases over HTTPS and never
+accepts a release-supplied download host. Concurrent updates share the manager
+lock. Like toolchain installation, checksum verification trusts the official
+release publisher; it does not independently verify provenance attestations.
+
+Older versions do not contain this command. Upgrade them once with the installer
+in manager-only mode to preserve your current compiler selection:
+
+```sh
+curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s -- --default-toolchain none
+```
+
 ## Select a toolchain
 
 ```sh

@@ -12,12 +12,15 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <poll.h>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -25,6 +28,7 @@
 #include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -233,6 +237,9 @@ std::string sha256(const fs::path &p) {
   return result;
 }
 struct Endpoints {
+  std::string manager_api = "https://api.github.com/repos/lang-gti-official/gtiup";
+  std::string manager_downloads =
+      "https://github.com/lang-gti-official/gtiup/releases/download/";
   std::string api = "https://api.github.com/repos/lang-gti-official/gti";
   std::string downloads =
       "https://github.com/lang-gti-official/gti/releases/download/";
@@ -247,6 +254,8 @@ struct Endpoints {
                             std::regex(R"(^http://127\.0\.0\.1:[0-9]+$)")))
         throw Error("test server must be loopback");
       api = server + "/api";
+      manager_api = server + "/manager-api";
+      manager_downloads = server + "/manager-downloads/";
       downloads = server + "/downloads/";
       status = server + "/status";
       test = true;
@@ -522,6 +531,78 @@ void extract(const fs::path &package, const fs::path &destination) {
       throw Error("truncated archive member");
   }
 }
+// Probe only a checksum-verified candidate, without a shell. Bound both runtime
+// and output so a broken release cannot hang an update or fill a filesystem.
+std::string manager_version(const fs::path &binary) {
+  int output[2];
+  if (pipe(output))
+    throw Error("cannot create manager version pipe");
+  const auto path = binary.string();
+  const auto child = fork();
+  if (child == 0) {
+    close(output[0]);
+    dup2(output[1], STDOUT_FILENO);
+    dup2(output[1], STDERR_FILENO);
+    close(output[1]);
+    const int null = open("/dev/null", O_RDONLY);
+    if (null >= 0) {
+      dup2(null, STDIN_FILENO);
+      close(null);
+    }
+    execl(path.c_str(), path.c_str(), "--version", static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  close(output[1]);
+  if (child < 0) {
+    close(output[0]);
+    throw Error("cannot start manager version check");
+  }
+  bool reaped = false;
+  int status = 0;
+  std::string result;
+  try {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool eof = false;
+    while (!eof || !reaped) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw Error("manager version check timed out");
+      pollfd fd{output[0], POLLIN, 0};
+      const auto ready = poll(eof ? nullptr : &fd, eof ? 0 : 1, 50);
+      if (ready < 0 && errno != EINTR)
+        throw Error("cannot read manager version");
+      if (ready > 0 && (fd.revents & (POLLIN | POLLHUP))) {
+        std::array<char, 256> bytes;
+        const auto count = ::read(output[0], bytes.data(), bytes.size());
+        if (count == 0)
+          eof = true;
+        else if (count > 0) {
+          result.append(bytes.data(), static_cast<std::size_t>(count));
+          if (result.size() > 256)
+            throw Error("manager version output exceeds size limit");
+        } else if (errno != EINTR)
+          throw Error("cannot read manager version");
+      }
+      if (!reaped) {
+        const auto waited = waitpid(child, &status, WNOHANG);
+        if (waited == child)
+          reaped = true;
+        else if (waited < 0 && errno != EINTR)
+          throw Error("cannot wait for manager version check");
+      }
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      throw Error("downloaded manager failed its version check");
+  } catch (...) {
+    if (!reaped) {
+      kill(child, SIGKILL);
+      while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+    close(output[0]);
+    throw;
+  }
+  close(output[0]);
+  return trim(result);
+}
 struct Manager {
   fs::path home;
   Endpoints urls;
@@ -658,6 +739,130 @@ struct Manager {
     std::cout << "Installed " << channel << ": " << rel.tag << " (" << identity
               << ")\n";
   }
+  void self_update() {
+#ifdef __linux__
+    // Another updater may have replaced the inode after this process started.
+    // Keep the installed pathname; the lock and recorded digest below validate
+    // the current on-disk manager before deciding whether an update is needed.
+    auto running = fs::read_symlink("/proc/self/exe").string();
+    const std::string deleted = " (deleted)";
+    if (running.size() >= deleted.size() &&
+        running.compare(running.size() - deleted.size(), deleted.size(), deleted) == 0)
+      running.resize(running.size() - deleted.size());
+    const auto self = fs::weakly_canonical(running);
+#else
+    const auto self = executable();
+#endif
+    Lock lock(home);
+    const auto bin = home / "bin";
+    const auto destination = bin / "gtiup";
+    const auto record = home / "manager.json";
+    if (fs::is_symlink(bin) || fs::is_symlink(destination) ||
+        !fs::is_regular_file(destination) || fs::canonical(destination) != self)
+      throw Error("self update requires the installed gtiup in " + bin.string() +
+                  "; install the manager first");
+    if (fs::is_symlink(record))
+      throw Error("refusing to overwrite manager metadata symlink");
+    const auto metadata = Json::parse(read(record, 4096));
+    if (metadata.value("schema", 0) != 1 || metadata.at("sha256") != sha256(destination))
+      throw Error("installed gtiup is not the recorded manager; refusing update");
+    const auto current = metadata.at("version").get<std::string>();
+    const std::regex stable_version(R"(^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$)");
+    if (!std::regex_match("v" + current, stable_version))
+      throw Error("invalid installed manager version");
+    const auto latest = remote_json(urls.manager_api + "/releases/latest", urls.test);
+    const auto tag = latest.at("tag_name").get<std::string>();
+    if (latest.at("draft") != false || latest.at("prerelease") != false ||
+        !std::regex_match(tag, stable_version))
+      throw Error("invalid stable manager release");
+    if (version_key(tag) <= version_key(current)) {
+      std::cout << "gtiup " << current << " is already up to date\n";
+      return;
+    }
+    const auto version = tag.substr(1);
+    const auto asset = "gtiup-" + host();
+    const auto base = urls.manager_downloads + tag + "/";
+    Temp tmp(bin);
+    download(base + asset + ".sha256", tmp.path / "checksum", 4096, urls.test);
+    std::istringstream line(read(tmp.path / "checksum"));
+    std::string expected, filename, extra;
+    line >> expected >> filename;
+    if (!std::regex_match(expected, digest_pattern) || filename != asset || (line >> extra))
+      throw Error("invalid manager checksum");
+    const auto candidate = tmp.path / "gtiup";
+    download(base + asset, candidate, 64 * 1024 * 1024, urls.test);
+    if (sha256(candidate) != expected)
+      throw Error("manager checksum mismatch");
+    download(base + asset + ".licenses.txt", tmp.path / "licenses", 4 * 1024 * 1024, urls.test);
+    if (trim(read(tmp.path / "licenses")).empty())
+      throw Error("manager license notice is empty");
+    fs::permissions(candidate, fs::perms::owner_all | fs::perms::group_read |
+                                   fs::perms::group_exec | fs::perms::others_read |
+                                   fs::perms::others_exec);
+    if (manager_version(candidate) != "gtiup " + version)
+      throw Error("downloaded manager version does not match release " + tag);
+    const auto share = home / "share";
+    const auto notices = share / "gtiup";
+    const auto license = notices / "licenses.txt";
+    if (fs::is_symlink(share) || fs::is_symlink(notices) || fs::is_symlink(license) ||
+        (fs::exists(license) && !fs::is_regular_file(license)))
+      throw Error("refusing to overwrite manager license path");
+    fs::create_directories(notices);
+    const bool had_license = fs::exists(license);
+    // Keep recoverable originals on the same filesystem. The executable is
+    // replaced with rename, so existing compiler/LSP invocations remain valid.
+    fs::create_hard_link(destination, tmp.path / "old-gtiup");
+    fs::copy_file(record, tmp.path / "old-manager.json");
+    if (had_license)
+      fs::copy_file(license, tmp.path / "old-licenses");
+    atomic_write(tmp.path / "manager.json", Json{{"schema", 1}, {"version", version},
+                                                {"sha256", expected}}.dump(2) + "\n");
+    const auto inject_failure = [](const char *step) {
+#ifdef GTIUP_TESTING
+      if (env("GTIUP_TEST_UPDATE_FAILURE") == step)
+        throw Error("injected manager update failure");
+#else
+      (void)step;
+#endif
+    };
+    bool binary_changed = false, metadata_changed = false, license_changed = false;
+    try {
+      fs::rename(candidate, destination);
+      binary_changed = true;
+      inject_failure("binary");
+      fs::rename(tmp.path / "manager.json", record);
+      metadata_changed = true;
+      inject_failure("metadata");
+      fs::rename(tmp.path / "licenses", license);
+      license_changed = true;
+      inject_failure("licenses");
+    } catch (...) {
+      std::error_code failure, error;
+      if (license_changed) {
+        if (had_license)
+          fs::rename(tmp.path / "old-licenses", license, error);
+        else
+          fs::remove(license, error);
+        if (error) failure = error;
+      }
+      if (metadata_changed) {
+        fs::rename(tmp.path / "old-manager.json", record, error);
+        if (error) failure = error;
+      }
+      if (binary_changed) {
+        fs::rename(tmp.path / "old-gtiup", destination, error);
+        if (error) failure = error;
+      }
+      if (failure) {
+        const auto recovery = tmp.path.string();
+        tmp.path.clear(); // Retain originals for recovery rather than deleting them.
+        throw Error("self update failed and rollback was incomplete: " + failure.message() +
+                    "; recovery files: " + recovery);
+      }
+      throw;
+    }
+    std::cout << "Updated gtiup " << current << " -> " << version << '\n';
+  }
   void bootstrap() {
     Lock lock(home);
     auto bin = home / "bin";
@@ -717,6 +922,7 @@ struct Manager {
 void help() {
   std::cout << "gtiup " GTIUP_VERSION " — GTI toolchain manager\n"
             << "  self-install [--default-toolchain CHANNEL|none]\n"
+            << "  self update\n"
             << "  install|update|default|uninstall CHANNEL\n"
             << "  list | show | which gti|gti_lsp | gc\n"
             << "  run CHANNEL gti|gti_lsp [ARGS...]\n"
@@ -751,7 +957,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     auto command = args[0];
-    if (command == "self-install") {
+    if (command == "self") {
+      if (args.size() != 2 || args[1] != "update")
+        throw Error("usage: gtiup self update");
+      manager.self_update();
+    } else if (command == "self-install") {
       if (args.size() != 1 &&
           (args.size() != 3 || args[1] != "--default-toolchain"))
         throw Error(
