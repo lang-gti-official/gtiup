@@ -14,19 +14,32 @@ and release packaging.
 On macOS arm64 or Linux x64:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/lang-gti-official/gtiup/main/install.sh \
-  -o /tmp/gtiup-install.sh
-sh /tmp/gtiup-install.sh --default-toolchain nightly
-export PATH="$HOME/.gtiup/bin:$PATH"
+curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh
 ```
 
-You can inspect the downloaded script before running it. Add the PATH setting
-to your shell configuration to keep it. The installer does not edit shell files,
-use sudo, or replace unrelated commands. Omit `--default-toolchain` to install
-only the manager; choose a compiler later. Set `GTIUP_HOME` to change the install
-location, or `GTIUP_VERSION=v0.1.0` to pin the manager release. Re-running the
-installer updates an existing, checksum-recorded manager atomically.
+This installs gtiup and the **nightly** GTI toolchain, then configures PATH for
+bash, zsh or sh. Open a new terminal afterward and run `gti --version`.
+Existing shell configuration is preserved; repeating the installer does not
+add duplicate PATH entries. No sudo is required.
+
+Choose another channel during installation:
+
+```sh
+curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s -- --default-toolchain preview
+```
+
+Use `nightly`, `beta`, `stable`, or an explicit published version in place of
+`preview`. Unpublished channels fail clearly instead of falling back. Use
+`--default-toolchain none` for manager-only installation, and `--no-modify-path`
+to manage shell configuration yourself (also for shells other than bash/zsh/sh).
+The script creates `~/.gtiup/env`, sources it from `.profile` and the selected
+shell's startup files, and leaves unrelated settings intact. You can inspect the
+script before executing it by downloading it to a file first.
+
+Set `GTIUP_HOME` to change the install location or `GTIUP_VERSION=v0.1.0` to pin
+the manager release. Re-running the default installer updates the manager and
+selects nightly again; pass your desired channel explicitly to retain another
+selection, or `--default-toolchain none` to update only the manager.
 
 For manual installation, download `gtiup-darwin-arm64` or `gtiup-linux-x64`, its
 `.sha256` and `.licenses.txt` from [Releases](https://github.com/lang-gti-official/gtiup/releases).
