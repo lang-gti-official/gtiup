@@ -110,6 +110,31 @@ stderr gets concise stage messages without an animated progress line. This also
 applies to `gtiup self update`; compiler/LSP proxies and command results on stdout
 are unchanged.
 
+With gtiup 0.4.0 or later, update the language server independently:
+
+```sh
+gtiup update lsp          # current project/environment/default toolchain
+gtiup update lsp nightly  # explicitly update the installed nightly LSP
+gtiup show               # includes the independently installed LSP source
+```
+
+This requires a toolchain containing the new LSP compatibility metadata. Older
+toolchains need a complete `gtiup update <channel>` first. The component must
+match the selected compiler, standard library, runtime and parser inputs exactly;
+it must also be at least as new in source ancestry as the installed LSP. An
+unmerged preview with a newer or divergent adapter keeps its current LSP.
+Missing compatible components leave the selection unchanged.
+
+The manager downloads and verifies the component, then atomically activates a
+new immutable prefix. The compiler and resources retain their original bytes
+and share hard links with the old prefix; only the LSP changes. Existing
+processes retain their old executable. Restart Neovim's LSP client to use the
+update; managed Neovim already resolves it through `gtiup which gti_lsp`.
+Proxies remain offline and never download on startup. A complete channel update
+resets the override to its bundled LSP. Explicit `gc` can remove old prefixes
+after processes using them have stopped. No compiler channel is changed by an
+LSP-only update.
+
 With gtiup 0.2.0 or later, put a `gti-toolchain.toml` file in your project:
 
 ```toml

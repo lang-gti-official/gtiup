@@ -801,6 +801,136 @@ struct Manager {
     std::cout << "Installed " << channel << ": " << rel.tag << " (" << identity
               << ")\n";
   }
+  void update_lsp(std::string channel) {
+    channel = channel.empty() ? selected() : selection(channel);
+    status("Checking compatible LSP updates for " + channel + "...");
+    Lock lock(home);
+    auto s = state();
+    // which() checks the selected immutable store and executable containment.
+    const auto base = which("gti", channel).parent_path().parent_path();
+    const auto compatibility_file = base / "share/gti/LSP_COMPATIBILITY.json";
+    if (!fs::is_regular_file(compatibility_file))
+      throw Error("this toolchain predates independent LSP updates; run gtiup update " + channel);
+    const auto contract = Json::parse(read(compatibility_file, 4096));
+    const auto compatibility = contract.at("compatibility").get<std::string>();
+    if (contract.at("schema") != 1 || !std::regex_match(compatibility, digest_pattern))
+      throw Error("invalid toolchain LSP compatibility identity");
+    // Preserve revocation checks for installed versioned compiler toolchains.
+    const auto compiler_tag = s["toolchains"][channel].at("tag").get<std::string>();
+    if (!rolling(compiler_tag))
+      release(compiler_tag, urls);
+    const auto prefix = "lsp-" + compatibility + "-";
+    Json newest;
+    std::uint64_t newest_run = 0;
+    for (int page = 1;; ++page) {
+      if (page > 100)
+        throw Error("release pagination limit exceeded");
+      const auto batch = remote_json(urls.api + "/releases?per_page=100&page=" + std::to_string(page), urls.test);
+      if (!batch.is_array())
+        throw Error("invalid release list");
+      for (const auto &r : batch) {
+        const auto tag = r.at("tag_name").get<std::string>();
+        if (r.at("draft").get<bool>() || !r.at("prerelease").get<bool>() || tag.rfind(prefix, 0) != 0)
+          continue;
+        const auto suffix = tag.substr(prefix.size());
+        if (!std::regex_match(suffix, std::regex("[1-9][0-9]{0,19}")))
+          throw Error("invalid LSP release ordering");
+        const auto run = std::stoull(suffix);
+        if (run > newest_run) {
+          newest_run = run;
+          newest = r;
+        }
+      }
+      if (batch.size() < 100)
+        break;
+    }
+    if (newest.is_null()) {
+      std::cout << "No compatible LSP update is published for " << channel << '\n';
+      return;
+    }
+    auto &record = s["toolchains"][channel];
+    if (record.contains("lsp") && record["lsp"].at("compatibility") == compatibility &&
+        record["lsp"].at("run_id").get<std::uint64_t>() >= newest_run) {
+      std::cout << "LSP for " << channel << " is already up to date\n";
+      return;
+    }
+    const auto tag = newest.at("tag_name").get<std::string>();
+    const auto url = urls.downloads + tag + "/";
+    const auto manifest = remote_json(url + "lsp.json", urls.test);
+    const auto source = manifest.at("source").get<std::string>();
+    if (manifest.at("schema") != 1 || manifest.at("kind") != "gti-lsp" ||
+        manifest.at("compatibility") != compatibility || !std::regex_match(source, sha_pattern) ||
+        newest.at("target_commitish") != source || !manifest.at("run_id").is_number_unsigned() ||
+        manifest.at("run_id").get<std::uint64_t>() != newest_run ||
+        !manifest.at("attempt").is_number_unsigned() || manifest.at("attempt").get<std::uint64_t>() == 0)
+      throw Error("LSP release identity or compatibility mismatch");
+    const auto installed_source = record.contains("lsp")
+        ? record["lsp"].at("source").get<std::string>()
+        : trim(read(base / "share/gti/LSP_SOURCE", 128));
+    if (!std::regex_match(installed_source, sha_pattern))
+      throw Error("installed LSP source identity is unavailable; update the complete toolchain");
+    if (installed_source != source) {
+      const auto comparison = remote_json(urls.api + "/compare/" + installed_source + "..." + source, urls.test);
+      if (comparison.at("status") != "ahead" && comparison.at("status") != "identical")
+        throw Error("published LSP is older than or diverges from the installed toolchain; keeping the current LSP");
+    }
+    const auto platform = host();
+    const auto asset = "gti-lsp-" + platform + ".tar.gz";
+    const auto item = manifest.at("platforms").at(platform);
+    const auto digest = item.at("sha256").get<std::string>();
+    if (item.at("asset") != asset || !std::regex_match(digest, digest_pattern))
+      throw Error("invalid LSP archive identity");
+    Temp tmp(home / "toolchains");
+    download(url + asset, tmp.path / asset, download_limit, urls.test, "LSP for " + channel);
+    status("Verifying compatible LSP archive...");
+    if (sha256(tmp.path / asset) != digest)
+      throw Error("LSP archive checksum mismatch");
+    const auto component = tmp.path / "component";
+    fs::create_directory(component);
+    extract(tmp.path / asset, component);
+    const auto binary = component / "bin/gti_lsp";
+    const auto identity_file = component / "share/gti/LSP_COMPONENT.json";
+    const Json identity = {{"schema", 1}, {"kind", "gti-lsp"}, {"compatibility", compatibility},
+                           {"source", source}, {"run_id", newest_run}, {"attempt", manifest.at("attempt")},
+                           {"platform", platform}};
+    for (const auto &entry : fs::recursive_directory_iterator(component)) {
+      const auto name = entry.path().lexically_relative(component).generic_string();
+      if (entry.is_symlink() || (entry.is_regular_file() && name != "bin/gti_lsp" &&
+          name != "share/gti/LSP_COMPONENT.json" && name.rfind("share/licenses/gti/", 0) != 0))
+        throw Error("unexpected LSP component contents");
+    }
+    if (!fs::is_regular_file(binary) || access(binary.c_str(), X_OK) ||
+        Json::parse(read(identity_file, 4096)) != identity)
+      throw Error("embedded LSP identity or executable mismatch");
+    status("Activating compatible LSP for " + channel + "...");
+    // Clone the immutable prefix using hard links. Only the LSP inode is
+    // replaced; compiler, parser and stdlib bytes retain their original identity.
+    // All resources remain at their normal relative paths for both Neovim and
+    // direct gti_lsp invocations. Older running processes keep their old prefix.
+    const auto staged = tmp.path / "stage";
+    for (const auto &entry : fs::recursive_directory_iterator(base))
+      if (entry.is_symlink() && !contains(base, fs::canonical(entry.path())))
+        throw Error("installed toolchain contains an escaping symlink");
+    fs::copy(base, staged, fs::copy_options::recursive | fs::copy_options::create_hard_links |
+                                fs::copy_options::copy_symlinks);
+    fs::remove(staged / "bin/gti_lsp");
+    fs::rename(binary, staged / "bin/gti_lsp");
+    atomic_write(staged / "share/gti/LSP_COMPONENT.json", identity.dump(2) + "\n");
+    // Include the original prefix identity so reusing one compatible LSP with
+    // two toolchains cannot accidentally substitute the other's resources.
+    atomic_write(tmp.path / "activation", base.filename().string() + "\n" + digest);
+    const auto directory = compiler_tag + "-" + sha256(tmp.path / "activation");
+    const auto target = home / "toolchains" / directory;
+    if (fs::exists(target) || fs::is_symlink(target))
+      throw Error("LSP activation directory already exists; run gtiup gc before retrying");
+    fs::rename(staged, target);
+    record["directory"] = directory;
+    record["lsp"] = identity;
+    record["lsp"]["sha256"] = digest;
+    record["lsp"]["tag"] = tag;
+    save(s);
+    std::cout << "Updated LSP for " << channel << ": " << source << '\n';
+  }
   void self_update() {
     status("Checking for gtiup updates...");
 #ifdef __linux__
@@ -988,6 +1118,7 @@ void help() {
             << "  self-install [--default-toolchain CHANNEL|none]\n"
             << "  self update\n"
             << "  install|update|default|uninstall CHANNEL\n"
+            << "  update lsp [CHANNEL]\n"
             << "  list | show | which gti|gti_lsp | gc\n"
             << "  run CHANNEL gti|gti_lsp [ARGS...]\n"
             << "Channels: preview, nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N\n"
@@ -1035,6 +1166,10 @@ int main(int argc, char **argv) {
       manager.bootstrap();
       if (args.size() == 3 && args[2] != "none")
         manager.install(args[2], true);
+    } else if (command == "update" && args.size() >= 2 && args[1] == "lsp") {
+      if (args.size() > 3)
+        throw Error("usage: gtiup update lsp [CHANNEL]");
+      manager.update_lsp(args.size() == 3 ? args[2] : "");
     } else if (command == "install" || command == "update" ||
                command == "default" || command == "uninstall") {
       if (args.size() != 2)
@@ -1078,6 +1213,9 @@ int main(int argc, char **argv) {
     } else if (command == "show" && args.size() == 1) {
       std::cout << manager.selected() << '\n'
                 << manager.which("gti").string() << '\n';
+      const auto record = manager.state()["toolchains"][manager.selected()];
+      if (record.contains("lsp"))
+        std::cout << "LSP component " << record["lsp"].at("source").get<std::string>() << '\n';
     } else if (command == "gc" && args.size() == 1) {
       Lock lock(manager.home);
       std::set<std::string> active;
