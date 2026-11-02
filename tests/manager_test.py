@@ -7,11 +7,15 @@ import json
 import os
 from pathlib import Path
 import platform
+import pty
+import re
+import select
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 
 TEST, PRODUCTION, UPDATE = map(lambda p: str(Path(p).resolve()), sys.argv[1:4])
@@ -28,6 +32,7 @@ class Manager(unittest.TestCase):
         self.home = self.root / 'home with spaces'
         self.cwd = self.root / 'project'; self.cwd.mkdir()
         self.routes = {}
+        self.slow = {}
         self.requests = []
         parent = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -39,7 +44,18 @@ class Manager(unittest.TestCase):
                 data = json.dumps(value).encode() if isinstance(value, (dict, list)) else value
                 declared = None
                 if isinstance(data, tuple): data, declared = data
-                self.send_response(200); self.send_header('Content-Length', str(len(data) if declared is None else declared)); self.end_headers(); self.wfile.write(data)
+                slow = parent.slow.get(self.path)
+                self.send_response(200)
+                if slow is None or not slow[1]:
+                    self.send_header('Content-Length', str(len(data) if declared is None else declared))
+                self.end_headers()
+                if slow:
+                    split = len(data) // 2
+                    self.wfile.write(data[:split]); self.wfile.flush()
+                    slow[0].wait(10)
+                    self.wfile.write(data[split:])
+                else:
+                    self.wfile.write(data)
             def log_message(self, *args): pass
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
@@ -92,6 +108,66 @@ class Manager(unittest.TestCase):
         self.assertEqual(state['toolchains']['beta']['tag'], 'v0.3.0-beta.2')
         self.assertEqual(len(state['toolchains']), 6)
         self.assertIn('preview', self.run_cli('list').stdout)
+
+    def test_download_stages_are_on_stderr_without_terminal_controls(self):
+        self.package('preview')
+        raw = subprocess.run([TEST, 'default', 'preview'], cwd=self.cwd, env=self.env,
+                             capture_output=True, timeout=15)
+        self.assertEqual(raw.returncode, 0, raw.stderr)
+        self.assertNotIn(b'\r', raw.stderr); self.assertNotIn(b'\x1b', raw.stderr)
+        stderr, stdout = raw.stderr.decode(), raw.stdout.decode()
+        stages = ('Checking preview release', 'Downloading preview', 'Downloaded preview',
+                  'Verifying archive checksum', 'Extracting preview', 'Verifying toolchain identity',
+                  'Activating preview')
+        for stage in stages:
+            self.assertIn(stage, stderr)
+        positions = [stderr.index(stage) for stage in stages]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(stdout.startswith('Installed preview:'))
+        self.assertNotIn('Downloading', stdout)
+        self.assertEqual(self.run_cli('default', 'preview').stderr, '')
+
+    def test_live_terminal_progress_before_download_finishes(self):
+        for unknown_size in (False, True):
+            with self.subTest(unknown_size=unknown_size):
+                path = self.package('preview')
+                release = threading.Event()
+                self.slow[path] = (release, unknown_size)
+                master, slave = pty.openpty()
+                process = subprocess.Popen([TEST, 'update', 'preview'], cwd=self.cwd, env=self.env,
+                                           stdout=subprocess.PIPE, stderr=slave)
+                os.close(slave)
+                output = b''
+                try:
+                    deadline = time.monotonic() + 6
+                    # Hold the second half of the response until progress is visible.
+                    pattern = rb'MiB - [1-9][0-9]*s' if unknown_size else rb'MiB \(50%\)'
+                    while time.monotonic() < deadline and not re.search(pattern, output):
+                        if select.select([master], [], [], 0.2)[0]:
+                            output += os.read(master, 8192)
+                    self.assertIsNone(process.poll(), output)
+                    self.assertIn(b'Downloading preview', output)
+                    self.assertRegex(output, pattern)
+                    self.assertNotIn(b'Installed', output)
+                    if unknown_size:
+                        self.assertNotIn(b'%)', output)
+                finally:
+                    release.set()
+                    stdout, _ = process.communicate(timeout=10)
+                    os.close(master)
+                self.assertEqual(process.returncode, 0, output)
+                self.assertIn(b'Installed preview', stdout)
+
+    def test_interrupted_download_never_reports_success(self):
+        path = self.package('preview')
+        self.routes[path] = (b'partial', 100)
+        result = self.run_cli('default', 'preview', ok=False)
+        self.assertIn('Downloading preview', result.stderr)
+        self.assertIn('download failed', result.stderr)
+        self.assertNotIn('Downloaded preview', result.stderr)
+        self.assertNotIn('Activating', result.stderr)
+        self.assertNotIn('Installed', result.stdout)
+        self.assertFalse((self.home / 'settings.json').exists())
 
     def test_selection_proxy_arguments_and_offline_resolution(self):
         for tag in ('preview', 'nightly'): self.package(tag); self.run_cli('install', tag)
@@ -271,6 +347,9 @@ class Manager(unittest.TestCase):
         base = self.manager_release()
         result = self.run_cli('self', 'update', binary=binary)
         self.assertIn('-> 99.0.0', result.stdout)
+        self.assertIn('Checking for gtiup updates', result.stderr)
+        self.assertIn('Downloading gtiup 99.0.0', result.stderr)
+        self.assertIn('Verifying gtiup checksum and version', result.stderr)
         self.assertEqual(self.run_cli('--version', binary=binary).stdout.strip(), 'gtiup 99.0.0')
         after = self.manager_snapshot()
         self.assertEqual(after['settings.json'], before['settings.json'])

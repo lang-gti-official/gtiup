@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <poll.h>
@@ -282,8 +283,54 @@ size_t receive(char *ptr, size_t size, size_t count, void *data) {
   sink.size += bytes;
   return bytes;
 }
+void status(const std::string &message) {
+  std::cerr << "gtiup: " << message << '\n';
+}
+struct DownloadProgress {
+  bool terminal;
+  bool line = false;
+  std::size_t width = 0;
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point updated = started;
+
+  static int report(void *data, curl_off_t total, curl_off_t received,
+                    curl_off_t, curl_off_t) noexcept {
+    auto &progress = *static_cast<DownloadProgress *>(data);
+    if (!progress.terminal)
+      return 0;
+    try {
+      const auto now = std::chrono::steady_clock::now();
+      if (progress.line && now - progress.updated < std::chrono::seconds(1))
+        return 0;
+      progress.updated = now;
+      std::ostringstream text;
+      text << "  " << std::fixed << std::setprecision(1)
+           << received / (1024.0 * 1024.0);
+      if (total > 0)
+        text << " / " << total / (1024.0 * 1024.0) << " MiB ("
+             << std::setprecision(0) << std::min(100.0, 100.0 * received / total) << "%)";
+      else
+        text << " MiB";
+      text << " - " << std::chrono::duration_cast<std::chrono::seconds>(now - progress.started).count()
+           << "s";
+      const auto rendered = text.str();
+      progress.width = std::max(progress.width, rendered.size());
+      std::cerr << '\r' << rendered << std::string(progress.width - rendered.size(), ' ') << std::flush;
+      progress.line = true;
+      return 0;
+    } catch (...) {
+      // Never allow an exception to cross libcurl's C callback boundary.
+      return 1;
+    }
+  }
+  void finish() {
+    if (line)
+      std::cerr << '\n';
+  }
+};
 void download(const std::string &url, const fs::path &target,
-              std::uint64_t limit = download_limit, bool test = false) {
+              std::uint64_t limit = download_limit, bool test = false,
+              const std::string &label = {}) {
   std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
                                                            curl_easy_cleanup);
   if (!curl)
@@ -304,10 +351,20 @@ void download(const std::string &url, const fs::path &target,
   curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "gtiup/" GTIUP_VERSION);
   curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, receive);
   curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
+  DownloadProgress progress{!label.empty() && isatty(STDERR_FILENO)};
+  if (!label.empty()) {
+    status("Downloading " + label + "...");
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, DownloadProgress::report);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &progress);
+  }
   auto result = curl_easy_perform(curl.get());
+  progress.finish();
   sink.out.close();
   if (result != CURLE_OK || !sink.out)
     throw Error("download failed: " + url + ": " + curl_easy_strerror(result));
+  if (!label.empty())
+    status("Downloaded " + label + " (" + std::to_string(sink.size) + " bytes)");
 }
 Json remote_json(const std::string &url, bool test) {
   Temp tmp(fs::temp_directory_path());
@@ -672,6 +729,7 @@ struct Manager {
   }
   void install(const std::string &requested, bool set_default = false) {
     auto channel = selection(requested);
+    status("Checking " + channel + " release...");
     Lock lock(home);
     auto rel = release(channel, urls);
     auto asset = rel.stem + "-" + host() + ".tar.gz";
@@ -689,13 +747,16 @@ struct Manager {
         (line >> extra))
       throw Error("invalid release checksum");
     auto package = tmp.path / asset;
-    download(base + asset, package, download_limit, urls.test);
+    download(base + asset, package, download_limit, urls.test, channel + " (" + host() + ")");
+    status("Verifying archive checksum...");
     auto digest = sha256(package);
     if (digest != expected)
       throw Error("archive checksum mismatch");
     auto staged = tmp.path / "stage";
     fs::create_directory(staged);
+    status("Extracting " + channel + "...");
     extract(package, staged);
+    status("Verifying toolchain identity...");
     for (const auto &tool : {"gti", "gti_lsp"}) {
       auto p = staged / "bin" / tool;
       if (!fs::is_regular_file(p) || access(p.c_str(), X_OK))
@@ -723,6 +784,7 @@ struct Manager {
         throw Error("preview inclusion/source mismatch");
     }
     auto directory = rel.tag + "-" + digest;
+    status("Activating " + channel + "...");
     auto target = store / directory;
     if (fs::is_symlink(target))
       throw Error("toolchain directory must not be a symlink");
@@ -740,6 +802,7 @@ struct Manager {
               << ")\n";
   }
   void self_update() {
+    status("Checking for gtiup updates...");
 #ifdef __linux__
     // Another updater may have replaced the inode after this process started.
     // Keep the installed pathname; the lock and recorded digest below validate
@@ -790,7 +853,8 @@ struct Manager {
     if (!std::regex_match(expected, digest_pattern) || filename != asset || (line >> extra))
       throw Error("invalid manager checksum");
     const auto candidate = tmp.path / "gtiup";
-    download(base + asset, candidate, 64 * 1024 * 1024, urls.test);
+    download(base + asset, candidate, 64 * 1024 * 1024, urls.test, "gtiup " + version + " (" + host() + ")");
+    status("Verifying gtiup checksum and version...");
     if (sha256(candidate) != expected)
       throw Error("manager checksum mismatch");
     download(base + asset + ".licenses.txt", tmp.path / "licenses", 4 * 1024 * 1024, urls.test);

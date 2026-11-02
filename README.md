@@ -103,6 +103,13 @@ Versions above illustrate syntax, not a promise that those releases exist.
 Channels that have not been published fail clearly. A yanked stable or withdrawn
 beta is refused; the manager never silently substitutes another release.
 
+Installation and updates report release lookup, download, verification,
+extraction and activation on stderr. In a terminal, downloads show transferred
+MiB, a percentage when the server supplies a size, and elapsed time. Redirected
+stderr gets concise stage messages without an animated progress line. This also
+applies to `gtiup self update`; compiler/LSP proxies and command results on stdout
+are unchanged.
+
 With gtiup 0.2.0 or later, put a `gti-toolchain.toml` file in your project:
 
 ```toml
