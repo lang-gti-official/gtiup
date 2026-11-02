@@ -73,7 +73,7 @@ class Manager(unittest.TestCase):
 
     def state(self): return json.loads((self.home / 'settings.json').read_text())
 
-    def package(self, tag='nightly', identity=SHA, missing=None, extra=(), version=None):
+    def package(self, tag='nightly', identity=SHA, missing=None, extra=(), version=None, compatibility=None):
         rolling = tag in ('nightly', 'preview')
         version = version or ('0.1.0' if rolling else tag[1:].split('-beta.')[0])
         stem = 'gti-' + tag if rolling else 'gti-v' + version
@@ -83,6 +83,10 @@ class Manager(unittest.TestCase):
                 'share/gti/VERSION': version, 'share/gti/BUILD_ID': identity,
                 'share/gti/PREVIEW_SOURCE': identity,
                 'share/gti/preview.json': json.dumps({'schema': 1, 'features': [{'task': 'fixture'}]})}
+        if compatibility is not None:
+            data['share/gti/LSP_COMPATIBILITY.json'] = json.dumps({'schema': 1, 'compatibility': compatibility})
+            data['share/gti/LSP_SOURCE'] = identity
+            data['share/gti/parser/gti.so'] = 'matching parser fixture'
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode='w:gz') as tar:
             for name, value in data.items():
@@ -98,6 +102,106 @@ class Manager(unittest.TestCase):
         self.routes[base + 'BUILD_ID'] = SHA.encode()
         self.routes['/api/releases/tags/' + tag] = {'tag_name': tag, 'draft': False, 'prerelease': rolling or '-beta.' in tag}
         return base + asset
+
+    def lsp_component(self, compatibility='c' * 64, run=123, source='b' * 40,
+                      embedded=None, body=None):
+        tag = f'lsp-{compatibility}-{run}'
+        identity = {'schema': 1, 'kind': 'gti-lsp', 'compatibility': compatibility,
+                    'source': source, 'run_id': run, 'attempt': 1, 'platform': HOST}
+        entries = {'bin/gti_lsp': b'#!/bin/sh\necho patched-lsp\n',
+                   'share/gti/LSP_COMPONENT.json': json.dumps(embedded or identity).encode()}
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            for name, value in entries.items():
+                info = tarfile.TarInfo(name); info.size = len(value)
+                info.mode = 0o755 if name.startswith('bin/') else 0o644
+                archive.addfile(info, io.BytesIO(value))
+        data = stream.getvalue() if body is None else body
+        asset = f'gti-lsp-{HOST}.tar.gz'
+        manifest = {k:v for k,v in identity.items() if k != 'platform'}
+        manifest['platforms'] = {HOST: {'asset': asset, 'sha256': hashlib.sha256(data).hexdigest()}}
+        self.routes['/api/releases?per_page=100&page=1'] = [
+            {'tag_name': tag, 'target_commitish': source, 'draft': False, 'prerelease': True}]
+        self.routes['/api/compare/' + SHA + '...' + source] = {'status': 'ahead'}
+        base = '/downloads/' + tag + '/'
+        self.routes[base + 'lsp.json'] = manifest
+        self.routes[base + asset] = data
+        return base, manifest
+
+    def test_compatible_lsp_update_preserves_compiler_and_resources(self):
+        self.package('preview', compatibility='c' * 64)
+        self.run_cli('default', 'preview'); self.run_cli('self-install')
+        before = self.state()
+        original = self.home / 'toolchains' / before['toolchains']['preview']['directory']
+        self.lsp_component()
+        result = self.run_cli('update', 'lsp')
+        self.assertIn('Updated LSP for preview', result.stdout)
+        after = self.state(); self.assertEqual(before['default'], after['default'])
+        current = self.home / 'toolchains' / after['toolchains']['preview']['directory']
+        for name in ('bin/gti', 'share/gti/VERSION', 'share/gti/BUILD_ID', 'share/gti/parser/gti.so'):
+            self.assertEqual((original / name).read_bytes(), (current / name).read_bytes())
+            self.assertEqual((original / name).stat().st_ino, (current / name).stat().st_ino)
+        self.assertNotEqual((original / 'bin/gti_lsp').stat().st_ino, (current / 'bin/gti_lsp').stat().st_ino)
+        self.assertNotIn(b'patched-lsp', (original / 'bin/gti_lsp').read_bytes())
+        self.assertEqual(self.run_cli('run', 'preview', 'gti_lsp', '--version').stdout, 'patched-lsp\n')
+        self.assertIn('LSP component ' + 'b' * 40, self.run_cli('show').stdout)
+        requests = len(self.requests)
+        self.assertEqual(self.run_cli('--version', binary=str(self.home / 'bin/gti_lsp')).stdout, 'patched-lsp\n')
+        self.assertIn('compiler', self.run_cli('--version', binary=str(self.home / 'bin/gti')).stdout)
+        self.assertEqual(requests, len(self.requests))
+        self.assertIn('up to date', self.run_cli('update', 'lsp', 'preview').stdout)
+        self.lsp_component(run=122)
+        self.assertIn('up to date', self.run_cli('update', 'lsp').stdout)
+        self.assertEqual(self.state(), after)
+        self.run_cli('gc')
+        self.assertFalse(original.exists())
+        self.assertEqual(self.run_cli('run', 'preview', 'gti_lsp').stdout, 'patched-lsp\n')
+        self.run_cli('update', 'preview')
+        self.assertNotIn('lsp', self.state()['toolchains']['preview'])
+        self.assertNotIn('patched-lsp', self.run_cli('run', 'preview', 'gti_lsp').stdout)
+
+    def test_lsp_update_rejects_mismatches_without_activation(self):
+        self.package('preview', compatibility='c' * 64); self.run_cli('default', 'preview')
+        before = self.state()
+        for case in ('compatibility', 'source', 'run_id', 'attempt', 'asset', 'checksum', 'embedded', 'archive', 'missing'):
+            with self.subTest(case=case):
+                base, manifest = self.lsp_component()
+                asset = f'gti-lsp-{HOST}.tar.gz'
+                if case in ('compatibility', 'source'): manifest[case] = 'd' * (64 if case == 'compatibility' else 40)
+                elif case == 'run_id': manifest['run_id'] = 122
+                elif case == 'attempt': manifest['attempt'] = 0
+                elif case == 'asset': manifest['platforms'][HOST]['asset'] = '../untrusted'
+                elif case == 'checksum': self.routes[base + asset] = b'corrupted'
+                elif case == 'embedded': self.lsp_component(embedded={'schema': 1, 'platform': 'wrong'})
+                elif case == 'archive': self.lsp_component(body=b'not an archive')
+                elif case == 'missing': del manifest['platforms'][HOST]
+                self.run_cli('update', 'lsp', ok=False)
+                self.assertEqual(self.state(), before)
+                self.assertFalse(list((self.home / 'toolchains').glob('.gtiup-*')))
+        self.lsp_component(compatibility='d' * 64)
+        self.assertIn('No compatible', self.run_cli('update', 'lsp').stdout)
+        self.assertEqual(self.state(), before)
+
+    def test_lsp_update_cannot_downgrade_or_replace_unmerged_preview(self):
+        self.package('preview', compatibility='c' * 64)
+        self.run_cli('default', 'preview')
+        before = self.state()
+        self.lsp_component()
+        for status in ('behind', 'diverged'):
+            self.routes['/api/compare/' + SHA + '...' + 'b' * 40] = {'status': status}
+            result = self.run_cli('update', 'lsp', ok=False)
+            self.assertIn('older than or diverges', result.stderr)
+            self.assertEqual(before, self.state())
+
+    def test_lsp_update_uses_project_selection_and_handles_legacy_toolchains(self):
+        self.package('nightly'); self.run_cli('default', 'nightly')
+        self.assertIn('predates independent LSP', self.run_cli('update', 'lsp', ok=False).stderr)
+        self.package('preview', compatibility='c' * 64); self.run_cli('install', 'preview')
+        (self.cwd / 'gti-toolchain.toml').write_text('[toolchain]\nchannel = "preview"\n')
+        self.lsp_component(); self.run_cli('update', 'lsp')
+        self.assertEqual(self.state()['default'], 'nightly')
+        self.assertIn('lsp', self.state()['toolchains']['preview'])
+        self.assertNotIn('lsp', self.state()['toolchains']['nightly'])
 
     def test_all_channels_and_pinned_versions(self):
         for tag in ('preview', 'nightly', 'v0.2.0', 'v0.3.0-beta.2', 'v0.1.0'): self.package(tag)
