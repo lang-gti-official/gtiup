@@ -834,11 +834,42 @@ struct Manager {
     save(s);
     std::cout << "Unlinked " << name << "; " << prefix << " is unchanged\n";
   }
+  // A short, readable name for an installed build: a rolling channel's
+  // commit is abbreviated; a versioned release is its version.
+  static std::string build_label(const std::string &identity) {
+    return std::regex_match(identity, sha_pattern) ? identity.substr(0, 7) : identity;
+  }
+  static std::string version_note(const std::string &before, const std::string &after) {
+    if (after.empty())
+      return "";
+    if (before.empty() || before == after)
+      return " (GTI " + after + ")";
+    return " (GTI " + before + " -> " + after + ")";
+  }
+  // The compiler repository's web URL, for a link to the commits between two
+  // rolling builds; empty for any other (test) endpoint.
+  std::string compare_url(const std::string &from, const std::string &to) const {
+    const std::string suffix = "/releases/download/";
+    if (urls.downloads.rfind("https://github.com/", 0) != 0 ||
+        urls.downloads.size() <= suffix.size() ||
+        urls.downloads.compare(urls.downloads.size() - suffix.size(), suffix.size(), suffix) != 0)
+      return "";
+    return urls.downloads.substr(0, urls.downloads.size() - suffix.size()) +
+           "/compare/" + from + "..." + to;
+  }
   void install(const std::string &requested, bool set_default = false) {
     auto channel = installable(requested);
     status("Checking " + channel + " release...");
     Lock lock(home);
     auto rel = release(channel, urls);
+    // What this channel had before, so the result can say whether it moved.
+    Json previous;
+    {
+      auto current = state();
+      if (current["toolchains"].contains(channel) &&
+          current["toolchains"][channel].contains("sha256"))
+        previous = current["toolchains"][channel];
+    }
     auto asset = rel.stem + "-" + host() + ".tar.gz";
     auto store = home / "toolchains";
     fs::create_directories(store);
@@ -853,6 +884,24 @@ struct Manager {
     if (!std::regex_match(expected, digest_pattern) || filename != asset ||
         (line >> extra))
       throw Error("invalid release checksum");
+    // The published archive is the one already installed: report that the
+    // channel has not moved instead of downloading it again. A separately
+    // updated LSP component is the exception; reinstalling restores the
+    // toolchain's own.
+    if (!previous.is_null() && previous.value("sha256", "") == expected &&
+        previous.value("tag", "") == rel.tag && !previous.contains("lsp") &&
+        fs::is_directory(store / previous.value("directory", "")) &&
+        !fs::is_symlink(store / previous.value("directory", ""))) {
+      if (set_default) {
+        auto s = state();
+        s["default"] = channel;
+        save(s);
+      }
+      std::cout << channel << " is already up to date: "
+                << build_label(previous.value("identity", ""))
+                << version_note("", previous.value("version", "")) << '\n';
+      return;
+    }
     auto package = tmp.path / asset;
     download(base + asset, package, download_limit, urls.test, channel + " (" + host() + ")");
     status("Verifying archive checksum...");
@@ -894,12 +943,30 @@ struct Manager {
     s["toolchains"][channel] = Json{{"directory", directory},
                                     {"tag", rel.tag},
                                     {"identity", identity},
+                                    {"version", packaged_version},
                                     {"sha256", digest}};
     if (set_default)
       s["default"] = channel;
     save(s);
-    std::cout << "Installed " << channel << ": " << rel.tag << " (" << identity
-              << ")\n";
+    const auto before = previous.is_null() ? std::string() : previous.value("identity", "");
+    const auto before_version = previous.is_null() ? std::string() : previous.value("version", "");
+    if (before.empty()) {
+      std::cout << "Installed " << channel << ": " << build_label(identity)
+                << version_note("", packaged_version) << '\n';
+    } else if (before == identity) {
+      std::cout << "Reinstalled " << channel << ": " << build_label(identity)
+                << (previous.contains("lsp") ? " (same build; restored its bundled LSP)"
+                                             : " (same build)")
+                << '\n';
+    } else {
+      std::cout << "Updated " << channel << ": " << build_label(before) << " -> "
+                << build_label(identity) << version_note(before_version, packaged_version)
+                << '\n';
+      const auto link = rolling(rel.tag) && std::regex_match(before, sha_pattern)
+                            ? compare_url(before, identity) : std::string();
+      if (!link.empty())
+        std::cout << "Changes: " << link << '\n';
+    }
   }
   void update_lsp(std::string channel) {
     channel = channel.empty() ? selected() : selection(channel);
