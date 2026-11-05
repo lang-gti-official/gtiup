@@ -67,12 +67,47 @@ bool contains(const fs::path &root, const fs::path &path) {
       return false;
   return true;
 }
-std::string selection(const std::string &s) {
-  if (s == "preview" || s == "nightly" || s == "beta" || s == "stable")
+const std::regex link_pattern("^[A-Za-z][A-Za-z0-9_.-]{0,63}$");
+bool is_channel(const std::string &s) {
+  return s == "preview" || s == "nightly" || s == "beta" || s == "stable";
+}
+// A linked toolchain name never collides with a channel, a version or `none`.
+bool linked_name(const std::string &s) {
+  return std::regex_match(s, link_pattern) && !is_channel(s) && s != "none" &&
+         !std::regex_match(s, version_pattern);
+}
+// Published channels and versions only: what install/update can download.
+std::string release_selection(const std::string &s) {
+  if (is_channel(s))
     return s;
   if (!std::regex_match(s, version_pattern))
-    throw Error("expected preview, nightly, beta, stable, or X.Y.Z[-beta.N]");
+    throw Error("expected nightly, beta, stable, or X.Y.Z[-beta.N]");
   return s[0] == 'v' ? s : "v" + s;
+}
+// Anything a command or project can select: a release or a linked toolchain.
+std::string selection(const std::string &s) {
+  if (linked_name(s))
+    return s;
+  if (!is_channel(s) && !std::regex_match(s, version_pattern))
+    throw Error("expected nightly, beta, stable, X.Y.Z[-beta.N], or a linked "
+                "toolchain name");
+  return release_selection(s);
+}
+const char *preview_retired =
+    "the preview channel is retired and no longer published; use nightly "
+    "instead (gtiup install nightly). An installed preview keeps working "
+    "until you uninstall it";
+// The releases gtiup will download. Preview is retired: refuse it clearly
+// rather than silently substituting another channel.
+std::string installable(const std::string &s) {
+  if (linked_name(s))
+    throw Error(s + " is not a release channel; linked toolchains are "
+                    "registered with gtiup link and never installed or "
+                    "updated by gtiup");
+  auto channel = release_selection(s);
+  if (channel == "preview")
+    throw Error(preview_retired);
+  return channel;
 }
 bool rolling(const std::string &s) { return s == "preview" || s == "nightly"; }
 std::string project_selection(const fs::path &path, bool legacy) {
@@ -81,8 +116,8 @@ std::string project_selection(const fs::path &path, bool legacy) {
     if (legacy) {
       // Keep the original one-line format, and accept TOML in either filename.
       const auto name = trim(contents);
-      if (name == "preview" || name == "nightly" || name == "beta" ||
-          name == "stable" || std::regex_match(name, version_pattern))
+      if (is_channel(name) || linked_name(name) ||
+          std::regex_match(name, version_pattern))
         return selection(name);
     }
     const auto document = toml::parse(contents);
@@ -376,7 +411,7 @@ struct Release {
   std::string tag, stem, version;
 };
 Release release(std::string channel, const Endpoints &urls) {
-  channel = selection(channel);
+  channel = release_selection(channel);
   Json status;
   if (!rolling(channel)) {
     status = remote_json(urls.status, urls.test);
@@ -692,18 +727,25 @@ struct Manager {
     auto override = env("GTIUP_TOOLCHAIN");
     if (!override.empty())
       return selection(override);
+    const auto project = [this](const fs::path &file, bool legacy) {
+      auto name = project_selection(file, legacy);
+      if (linked_name(name) && !state()["toolchains"].contains(name))
+        throw Error(file.string() + ": no linked toolchain named " + name +
+                    "; register one with gtiup link " + name + " PREFIX");
+      return name;
+    };
     for (auto p = fs::current_path();; p = p.parent_path()) {
       if (fs::exists(p / "gti-toolchain"))
-        return project_selection(p / "gti-toolchain", true);
+        return project(p / "gti-toolchain", true);
       if (fs::exists(p / "gti-toolchain.toml"))
-        return project_selection(p / "gti-toolchain.toml", false);
+        return project(p / "gti-toolchain.toml", false);
       if (p == p.root_path())
         break;
     }
     auto s = state();
     if (s["default"].is_null())
       throw Error("no default toolchain; run gtiup default nightly (or "
-                  "preview/beta/stable)");
+                  "beta/stable, or a linked toolchain)");
     return selection(s["default"]);
   }
   fs::path which(const std::string &tool, std::string channel = "") const {
@@ -711,10 +753,19 @@ struct Manager {
       throw Error("tool must be gti or gti_lsp");
     channel = channel.empty() ? selected() : selection(channel);
     auto s = state();
-    if (!s["toolchains"].contains(channel))
+    if (!s["toolchains"].contains(channel)) {
+      if (channel == "preview")
+        throw Error("preview is retired and not installed; select nightly "
+                    "instead (gtiup default nightly)");
+      if (linked_name(channel))
+        throw Error("no linked toolchain named " + channel +
+                    "; register one with gtiup link " + channel + " PREFIX");
       throw Error(channel + " is not installed; run gtiup install " + channel);
-    auto directory =
-        s["toolchains"][channel].at("directory").get<std::string>();
+    }
+    const auto &record = s["toolchains"][channel];
+    if (record.contains("linked"))
+      return linked_tool(record.at("linked").get<std::string>(), tool, channel);
+    auto directory = record.at("directory").get<std::string>();
     if (directory.empty() || fs::path(directory).filename() != directory ||
         directory == "." || directory == "..")
       throw Error("invalid toolchain directory");
@@ -727,8 +778,64 @@ struct Manager {
       throw Error("toolchain executable missing");
     return binary;
   }
+  // A linked prefix is used where it is, exactly like a managed prefix: the
+  // executable must be a regular file inside it so the compiler finds its own
+  // share/gti resources. gtiup never writes to or deletes a linked prefix.
+  static fs::path linked_tool(const fs::path &prefix, const std::string &tool,
+                              const std::string &name) {
+    if (!fs::is_directory(prefix))
+      throw Error("linked toolchain " + name + " prefix is missing: " +
+                  prefix.string());
+    const auto root = fs::canonical(prefix);
+    const auto path = root / "bin" / tool;
+    if (!fs::exists(path))
+      throw Error("linked toolchain " + name + " has no bin/" + tool + " in " +
+                  prefix.string());
+    const auto binary = fs::canonical(path);
+    if (!contains(root, binary) || !fs::is_regular_file(binary) ||
+        access(binary.c_str(), X_OK))
+      throw Error("linked toolchain " + name + ": bin/" + tool +
+                  " must be an executable file inside " + prefix.string());
+    return binary;
+  }
+  void link(const std::string &name, const std::string &requested) {
+    if (!linked_name(name))
+      throw Error("invalid linked toolchain name " + name +
+                  ": start with a letter and use letters, digits, '.', '_' or "
+                  "'-'; channel and version names are reserved");
+    auto prefix = fs::absolute(requested).lexically_normal();
+    if (prefix.filename().empty())
+      prefix = prefix.parent_path();
+    linked_tool(prefix, "gti", name);
+    if (fs::exists(prefix / "bin/gti_lsp") || fs::is_symlink(prefix / "bin/gti_lsp"))
+      linked_tool(prefix, "gti_lsp", name);
+    Lock lock(home);
+    auto s = state();
+    std::string previous;
+    if (s["toolchains"].contains(name))
+      previous = s["toolchains"][name].value("linked", "");
+    s["toolchains"][name] = Json{{"linked", prefix.string()}};
+    save(s);
+    std::cout << "Linked " << name << ": " << prefix.string();
+    if (!previous.empty() && previous != prefix.string())
+      std::cout << " (was " << previous << ")";
+    std::cout << '\n';
+  }
+  void unlink(const std::string &name) {
+    Lock lock(home);
+    auto s = state();
+    if (!s["toolchains"].contains(name) || !s["toolchains"][name].contains("linked"))
+      throw Error("no linked toolchain named " + name +
+                  (s["toolchains"].contains(name) ? "; use gtiup uninstall " + name : ""));
+    if (s["default"] == name)
+      throw Error("select another default before unlinking");
+    const auto prefix = s["toolchains"][name].at("linked").get<std::string>();
+    s["toolchains"].erase(name);
+    save(s);
+    std::cout << "Unlinked " << name << "; " << prefix << " is unchanged\n";
+  }
   void install(const std::string &requested, bool set_default = false) {
-    auto channel = selection(requested);
+    auto channel = installable(requested);
     status("Checking " + channel + " release...");
     Lock lock(home);
     auto rel = release(channel, urls);
@@ -776,13 +883,6 @@ struct Manager {
         throw Error(rel.tag + " changed during download; retry");
     } else if (packaged_version != rel.version)
       throw Error("archive version mismatch");
-    if (rel.tag == "preview") {
-      auto manifest = Json::parse(read(staged / "share/gti/preview.json"));
-      if (manifest.value("schema", 0) != 1 ||
-          !manifest.at("features").is_array() ||
-          trim(read(staged / "share/gti/PREVIEW_SOURCE", 128)) != identity)
-        throw Error("preview inclusion/source mismatch");
-    }
     auto directory = rel.tag + "-" + digest;
     status("Activating " + channel + "...");
     auto target = store / directory;
@@ -806,6 +906,9 @@ struct Manager {
     status("Checking compatible LSP updates for " + channel + "...");
     Lock lock(home);
     auto s = state();
+    if (s["toolchains"].contains(channel) && s["toolchains"][channel].contains("linked"))
+      throw Error(channel + " is a linked toolchain; gtiup never updates it. "
+                            "Reinstall your build into its prefix instead");
     // which() checks the selected immutable store and executable containment.
     const auto base = which("gti", channel).parent_path().parent_path();
     const auto compatibility_file = base / "share/gti/LSP_COMPATIBILITY.json";
@@ -1117,11 +1220,16 @@ void help() {
   std::cout << "gtiup " GTIUP_VERSION " — GTI toolchain manager\n"
             << "  self-install [--default-toolchain CHANNEL|none]\n"
             << "  self update\n"
-            << "  install|update|default|uninstall CHANNEL\n"
+            << "  install|update|uninstall CHANNEL\n"
+            << "  default CHANNEL|NAME\n"
+            << "  link NAME PREFIX | unlink NAME\n"
             << "  update lsp [CHANNEL]\n"
             << "  list | show | which gti|gti_lsp | gc\n"
-            << "  run CHANNEL gti|gti_lsp [ARGS...]\n"
-            << "Channels: preview, nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N\n"
+            << "  run CHANNEL|NAME gti|gti_lsp [ARGS...]\n"
+            << "Channels: nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N "
+               "(preview is retired)\n"
+            << "Linked toolchains: an existing install prefix registered with "
+               "gtiup link; never updated or deleted by gtiup\n"
             << "Project selection: nearest gti-toolchain or gti-toolchain.toml; override: "
                "GTIUP_TOOLCHAIN or gti +CHANNEL\n";
 }
@@ -1162,7 +1270,7 @@ int main(int argc, char **argv) {
         throw Error(
             "usage: gtiup self-install [--default-toolchain CHANNEL|none]");
       if (args.size() == 3 && args[2] != "none")
-        selection(args[2]);
+        installable(args[2]);
       manager.bootstrap();
       if (args.size() == 3 && args[2] != "none")
         manager.install(args[2], true);
@@ -1178,8 +1286,12 @@ int main(int argc, char **argv) {
       if (command == "install" || command == "update")
         manager.install(channel);
       else if (command == "default") {
-        if (!manager.state()["toolchains"].contains(channel))
+        if (!manager.state()["toolchains"].contains(channel)) {
+          if (linked_name(channel))
+            throw Error("no linked toolchain named " + channel +
+                        "; register one with gtiup link " + channel + " PREFIX");
           manager.install(channel, true);
+        }
         else {
           Lock lock(manager.home);
           auto s = manager.state();
@@ -1191,12 +1303,22 @@ int main(int argc, char **argv) {
       } else {
         Lock lock(manager.home);
         auto s = manager.state();
+        if (s["toolchains"].contains(channel) && s["toolchains"][channel].contains("linked"))
+          throw Error(channel + " is a linked toolchain; remove it with gtiup unlink " + channel);
         if (s["default"] == channel)
           throw Error("select another default before uninstalling");
         if (!s["toolchains"].erase(channel))
           throw Error("toolchain is not installed");
         manager.save(s);
       }
+    } else if (command == "link") {
+      if (args.size() != 3)
+        throw Error("usage: gtiup link NAME PREFIX");
+      manager.link(args[1], args[2]);
+    } else if (command == "unlink") {
+      if (args.size() != 2)
+        throw Error("usage: gtiup unlink NAME");
+      manager.unlink(args[1]);
     } else if (command == "which") {
       if (args.size() != 2)
         throw Error("usage: gtiup which gti|gti_lsp");
@@ -1208,8 +1330,11 @@ int main(int argc, char **argv) {
     } else if (command == "list" && args.size() == 1) {
       auto state = manager.state();
       for (const auto &[key, value] : state["toolchains"].items())
-        std::cout << key << ' ' << value.at("tag").get<std::string>() << ' '
-                  << value.at("identity").get<std::string>() << '\n';
+        if (value.contains("linked"))
+          std::cout << key << " linked " << value.at("linked").get<std::string>() << '\n';
+        else
+          std::cout << key << ' ' << value.at("tag").get<std::string>() << ' '
+                    << value.at("identity").get<std::string>() << '\n';
     } else if (command == "show" && args.size() == 1) {
       std::cout << manager.selected() << '\n'
                 << manager.which("gti").string() << '\n';
@@ -1220,8 +1345,10 @@ int main(int argc, char **argv) {
       Lock lock(manager.home);
       std::set<std::string> active;
       auto state = manager.state();
+      // Linked toolchains live outside the store and are never collected.
       for (const auto &entry : state["toolchains"])
-        active.insert(entry.at("directory").get<std::string>());
+        if (entry.contains("directory"))
+          active.insert(entry.at("directory").get<std::string>());
       auto store = manager.home / "toolchains";
       const std::regex managed(
           R"(^(preview|nightly|v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?)-[0-9a-f]{64}$)");
