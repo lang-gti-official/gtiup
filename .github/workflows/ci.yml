@@ -109,4 +109,4 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo 'Release already exists; refusing to replace it'; exit 1
           fi
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "gtiup $RELEASE_TAG" --notes 'Standalone C++ GTI toolchain manager for preview, nightly, beta and stable. No Python or GTI compiler required. See the repository README for installation and checksums.'
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "gtiup $RELEASE_TAG" --notes 'Standalone C++ GTI toolchain manager for nightly, beta, stable and linked local builds. No Python or GTI compiler required. See the repository README for installation and checksums.'

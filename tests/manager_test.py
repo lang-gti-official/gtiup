@@ -74,15 +74,13 @@ class Manager(unittest.TestCase):
     def state(self): return json.loads((self.home / 'settings.json').read_text())
 
     def package(self, tag='nightly', identity=SHA, missing=None, extra=(), version=None, compatibility=None):
-        rolling = tag in ('nightly', 'preview')
+        rolling = tag == 'nightly'
         version = version or ('0.1.0' if rolling else tag[1:].split('-beta.')[0])
         stem = 'gti-' + tag if rolling else 'gti-v' + version
         asset = stem + '-' + HOST + '.tar.gz'
         data = {'bin/gti': '#!/bin/sh\nprintf "compiler\\n"\nprintf "<%s>\\n" "$@"\n',
                 'bin/gti_lsp': '#!/bin/sh\nprintf "lsp\\n"\nprintf "<%s>\\n" "$@"\n',
-                'share/gti/VERSION': version, 'share/gti/BUILD_ID': identity,
-                'share/gti/PREVIEW_SOURCE': identity,
-                'share/gti/preview.json': json.dumps({'schema': 1, 'features': [{'task': 'fixture'}]})}
+                'share/gti/VERSION': version, 'share/gti/BUILD_ID': identity}
         if compatibility is not None:
             data['share/gti/LSP_COMPATIBILITY.json'] = json.dumps({'schema': 1, 'compatibility': compatibility})
             data['share/gti/LSP_SOURCE'] = identity
@@ -128,40 +126,168 @@ class Manager(unittest.TestCase):
         self.routes[base + asset] = data
         return base, manifest
 
+    def legacy_preview(self):
+        """A preview toolchain installed before gtiup retired the channel."""
+        self.package('nightly'); self.run_cli('install', 'nightly')
+        state = self.state(); record = state['toolchains'].pop('nightly')
+        directory = 'preview-' + record['sha256']
+        (self.home / 'toolchains' / record['directory']).rename(self.home / 'toolchains' / directory)
+        state['toolchains']['preview'] = {**record, 'directory': directory, 'tag': 'preview'}
+        (self.home / 'settings.json').write_text(json.dumps(state))
+
+    def local_prefix(self, name='gti-dev', lsp=True):
+        """A prefix shaped like `cmake --install build --prefix <dir>`."""
+        prefix = self.root / name
+        (prefix / 'bin').mkdir(parents=True); (prefix / 'share/gti').mkdir(parents=True)
+        (prefix / 'share/gti/VERSION').write_text('0.9.0\n')
+        tools = ('gti', 'gti_lsp') if lsp else ('gti',)
+        for tool in tools:
+            (prefix / 'bin' / tool).write_text(f'#!/bin/sh\nprintf "{name} {tool}\\n"\nprintf "<%s>\\n" "$@"\n')
+            (prefix / 'bin' / tool).chmod(0o755)
+        return prefix
+
+    def test_retired_preview_is_refused_without_downloading(self):
+        self.package('nightly')
+        for arguments in (('install', 'preview'), ('update', 'preview'), ('default', 'preview'),
+                          ('self-install', '--default-toolchain', 'preview')):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(*arguments, ok=False)
+                self.assertIn('preview channel is retired', result.stderr)
+                self.assertIn('gtiup install nightly', result.stderr)
+                self.assertNotIn('Installed', result.stdout)
+        self.assertEqual(self.requests, [])
+        self.assertFalse((self.home / 'settings.json').exists())
+        self.assertFalse((self.home / 'bin').exists(), 'self-install must refuse before bootstrapping')
+        self.assertIn('preview is retired and not installed', self.run_cli('run', 'preview', 'gti', ok=False).stderr)
+        self.assertNotIn('preview,', self.run_cli('--help').stdout)
+
+    def test_installed_preview_keeps_working_until_removed(self):
+        self.legacy_preview(); self.run_cli('self-install')
+        before = len(self.requests)
+        self.run_cli('default', 'preview')
+        self.assertIn('preview-', self.run_cli('which', 'gti').stdout)
+        self.assertIn('compiler', self.run_cli('+preview', '--version', binary=str(self.home / 'bin/gti')).stdout)
+        self.assertIn('lsp', self.run_cli('run', 'preview', 'gti_lsp').stdout)
+        self.assertIn('preview preview', self.run_cli('list').stdout)
+        self.assertEqual(before, len(self.requests))
+        # It is never refreshed: an update fails clearly and keeps the installation.
+        state = self.state()
+        self.assertIn('preview channel is retired', self.run_cli('update', 'preview', ok=False).stderr)
+        self.assertEqual(state, self.state())
+        self.package('nightly'); self.run_cli('default', 'nightly'); self.run_cli('uninstall', 'preview')
+        self.assertNotIn('preview', self.state()['toolchains'])
+
+    def test_linked_toolchain_selection_without_downloads(self):
+        prefix = self.local_prefix()
+        self.assertEqual(self.run_cli('link', 'dev', str(prefix) + '/').stdout, f'Linked dev: {prefix}\n')
+        self.run_cli('default', 'dev'); self.run_cli('self-install')
+        self.assertEqual(self.state()['toolchains']['dev'], {'linked': str(prefix)})
+        for tool in ('gti', 'gti_lsp'):
+            self.assertEqual(self.run_cli('which', tool).stdout.strip(), str((prefix / 'bin' / tool).resolve()))
+            result = self.run_cli('argument with spaces', binary=str(self.home / 'bin' / tool))
+            self.assertEqual(result.stdout, f'gti-dev {tool}\n<argument with spaces>\n')
+        other = self.local_prefix('gti-other')
+        self.run_cli('link', 'other', str(other))
+        self.assertIn('gti-other gti', self.run_cli('+other', binary=str(self.home / 'bin/gti')).stdout)
+        self.assertIn('gti-other gti_lsp', self.run_cli('run', 'other', 'gti_lsp').stdout)
+        self.assertIn('gti-other', self.run_cli('which', 'gti', env={**self.env, 'GTIUP_TOOLCHAIN': 'other'}).stdout)
+        (self.cwd / 'gti-toolchain').write_text('other\n')
+        self.assertEqual(self.run_cli('show').stdout.splitlines()[:2], ['other', str((other / 'bin/gti').resolve())])
+        (self.cwd / 'gti-toolchain').unlink()
+        (self.cwd / 'gti-toolchain.toml').write_text('[toolchain]\nchannel = "other"\n')
+        self.assertIn('gti-other', self.run_cli('which', 'gti').stdout)
+        (self.cwd / 'gti-toolchain.toml').unlink()
+        listed = self.run_cli('list').stdout.splitlines()
+        self.assertIn(f'dev linked {prefix}', listed); self.assertIn(f'other linked {other}', listed)
+        # gtiup never updates, installs, uninstalls or collects a linked toolchain.
+        self.assertIn('not a release channel', self.run_cli('update', 'dev', ok=False).stderr)
+        self.assertIn('not a release channel', self.run_cli('install', 'dev', ok=False).stderr)
+        self.assertIn('never updates it', self.run_cli('update', 'lsp', 'dev', ok=False).stderr)
+        self.assertIn('gtiup unlink dev', self.run_cli('uninstall', 'dev', ok=False).stderr)
+        self.run_cli('gc')
+        self.assertIn('select another default', self.run_cli('unlink', 'dev', ok=False).stderr)
+        self.run_cli('default', 'other')
+        self.assertIn('is unchanged', self.run_cli('unlink', 'dev').stdout)
+        self.assertNotIn('dev', self.state()['toolchains'])
+        self.assertTrue((prefix / 'bin/gti').is_file() and (prefix / 'bin/gti_lsp').is_file())
+        self.assertIn('no linked toolchain named dev', self.run_cli('unlink', 'dev', ok=False).stderr)
+        self.assertIn('gtiup link dev', self.run_cli('default', 'dev', ok=False).stderr)
+        self.assertIn('gtiup link dev', self.run_cli('+dev', binary=str(self.home / 'bin/gti'), ok=False).stderr)
+        # Re-linking replaces the prefix, which is read again on every invocation.
+        self.assertIn(f'(was {other})', self.run_cli('link', 'other', str(prefix)).stdout)
+        self.assertIn('gti-dev gti', self.run_cli('run', 'other', 'gti').stdout)
+        self.assertEqual(self.requests, [])
+
+    def test_link_validates_names_and_prefixes(self):
+        prefix = self.local_prefix()
+        for name in ('nightly', 'preview', 'beta', 'stable', 'none', '0.1.0', 'v0.1.0', '0.2.0-beta.1',
+                     '../dev', '-dev', '1dev', 'dev tools', ''):
+            with self.subTest(name=name):
+                self.assertIn('invalid linked toolchain name', self.run_cli('link', name, str(prefix), ok=False).stderr)
+        empty = self.root / 'empty'; empty.mkdir()
+        missing_lsp = self.local_prefix('gti-lsp-broken'); (missing_lsp / 'bin/gti_lsp').chmod(0o644)
+        escaping = self.local_prefix('gti-escape', lsp=False); (escaping / 'bin/gti').unlink()
+        (escaping / 'bin/gti').symlink_to(prefix / 'bin/gti')
+        unexecutable = self.local_prefix('gti-mode', lsp=False); (unexecutable / 'bin/gti').chmod(0o644)
+        for case, path, message in (('missing', self.root / 'absent', 'prefix is missing'),
+                                    ('no compiler', empty, 'has no bin/gti'),
+                                    ('lsp', missing_lsp, 'bin/gti_lsp must be an executable file'),
+                                    ('escape', escaping, 'bin/gti must be an executable file'),
+                                    ('mode', unexecutable, 'bin/gti must be an executable file')):
+            with self.subTest(case=case):
+                self.assertIn(message, self.run_cli('link', 'dev', str(path), ok=False).stderr)
+        self.assertFalse((self.home / 'settings.json').exists())
+        for arguments in (('link', 'dev'), ('link', 'dev', str(prefix), 'extra'), ('unlink',)):
+            self.assertIn('usage: gtiup', self.run_cli(*arguments, ok=False).stderr)
+        # A compiler-only prefix links; requesting its absent LSP fails clearly.
+        compiler_only = self.local_prefix('gti-compiler', lsp=False)
+        self.run_cli('link', 'dev', str(compiler_only)); self.run_cli('default', 'dev')
+        self.run_cli('which', 'gti')
+        self.assertIn('has no bin/gti_lsp', self.run_cli('which', 'gti_lsp', ok=False).stderr)
+        # A prefix removed after linking is reported, never recreated.
+        (compiler_only / 'bin/gti').unlink(); (compiler_only / 'bin').rmdir()
+        self.assertIn('has no bin/gti', self.run_cli('which', 'gti', ok=False).stderr)
+        for leftover in sorted(compiler_only.rglob('*'), reverse=True):
+            leftover.unlink() if leftover.is_file() else leftover.rmdir()
+        compiler_only.rmdir()
+        self.assertIn('prefix is missing', self.run_cli('which', 'gti', ok=False).stderr)
+        self.assertFalse(compiler_only.exists())
+        self.assertEqual(self.requests, [])
+
     def test_compatible_lsp_update_preserves_compiler_and_resources(self):
-        self.package('preview', compatibility='c' * 64)
-        self.run_cli('default', 'preview'); self.run_cli('self-install')
+        self.package('nightly', compatibility='c' * 64)
+        self.run_cli('default', 'nightly'); self.run_cli('self-install')
         before = self.state()
-        original = self.home / 'toolchains' / before['toolchains']['preview']['directory']
+        original = self.home / 'toolchains' / before['toolchains']['nightly']['directory']
         self.lsp_component()
         result = self.run_cli('update', 'lsp')
-        self.assertIn('Updated LSP for preview', result.stdout)
+        self.assertIn('Updated LSP for nightly', result.stdout)
         after = self.state(); self.assertEqual(before['default'], after['default'])
-        current = self.home / 'toolchains' / after['toolchains']['preview']['directory']
+        current = self.home / 'toolchains' / after['toolchains']['nightly']['directory']
         for name in ('bin/gti', 'share/gti/VERSION', 'share/gti/BUILD_ID', 'share/gti/parser/gti.so'):
             self.assertEqual((original / name).read_bytes(), (current / name).read_bytes())
             self.assertEqual((original / name).stat().st_ino, (current / name).stat().st_ino)
         self.assertNotEqual((original / 'bin/gti_lsp').stat().st_ino, (current / 'bin/gti_lsp').stat().st_ino)
         self.assertNotIn(b'patched-lsp', (original / 'bin/gti_lsp').read_bytes())
-        self.assertEqual(self.run_cli('run', 'preview', 'gti_lsp', '--version').stdout, 'patched-lsp\n')
+        self.assertEqual(self.run_cli('run', 'nightly', 'gti_lsp', '--version').stdout, 'patched-lsp\n')
         self.assertIn('LSP component ' + 'b' * 40, self.run_cli('show').stdout)
         requests = len(self.requests)
         self.assertEqual(self.run_cli('--version', binary=str(self.home / 'bin/gti_lsp')).stdout, 'patched-lsp\n')
         self.assertIn('compiler', self.run_cli('--version', binary=str(self.home / 'bin/gti')).stdout)
         self.assertEqual(requests, len(self.requests))
-        self.assertIn('up to date', self.run_cli('update', 'lsp', 'preview').stdout)
+        self.assertIn('up to date', self.run_cli('update', 'lsp', 'nightly').stdout)
         self.lsp_component(run=122)
         self.assertIn('up to date', self.run_cli('update', 'lsp').stdout)
         self.assertEqual(self.state(), after)
         self.run_cli('gc')
         self.assertFalse(original.exists())
-        self.assertEqual(self.run_cli('run', 'preview', 'gti_lsp').stdout, 'patched-lsp\n')
-        self.run_cli('update', 'preview')
-        self.assertNotIn('lsp', self.state()['toolchains']['preview'])
-        self.assertNotIn('patched-lsp', self.run_cli('run', 'preview', 'gti_lsp').stdout)
+        self.assertEqual(self.run_cli('run', 'nightly', 'gti_lsp').stdout, 'patched-lsp\n')
+        self.run_cli('update', 'nightly')
+        self.assertNotIn('lsp', self.state()['toolchains']['nightly'])
+        self.assertNotIn('patched-lsp', self.run_cli('run', 'nightly', 'gti_lsp').stdout)
 
     def test_lsp_update_rejects_mismatches_without_activation(self):
-        self.package('preview', compatibility='c' * 64); self.run_cli('default', 'preview')
+        self.package('nightly', compatibility='c' * 64); self.run_cli('default', 'nightly')
         before = self.state()
         for case in ('compatibility', 'source', 'run_id', 'attempt', 'asset', 'checksum', 'embedded', 'archive', 'missing'):
             with self.subTest(case=case):
@@ -182,9 +308,9 @@ class Manager(unittest.TestCase):
         self.assertIn('No compatible', self.run_cli('update', 'lsp').stdout)
         self.assertEqual(self.state(), before)
 
-    def test_lsp_update_cannot_downgrade_or_replace_unmerged_preview(self):
-        self.package('preview', compatibility='c' * 64)
-        self.run_cli('default', 'preview')
+    def test_lsp_update_cannot_downgrade_or_diverge(self):
+        self.package('nightly', compatibility='c' * 64)
+        self.run_cli('default', 'nightly')
         before = self.state()
         self.lsp_component()
         for status in ('behind', 'diverged'):
@@ -196,49 +322,49 @@ class Manager(unittest.TestCase):
     def test_lsp_update_uses_project_selection_and_handles_legacy_toolchains(self):
         self.package('nightly'); self.run_cli('default', 'nightly')
         self.assertIn('predates independent LSP', self.run_cli('update', 'lsp', ok=False).stderr)
-        self.package('preview', compatibility='c' * 64); self.run_cli('install', 'preview')
-        (self.cwd / 'gti-toolchain.toml').write_text('[toolchain]\nchannel = "preview"\n')
+        self.package('v0.2.0', compatibility='c' * 64); self.run_cli('install', 'stable')
+        (self.cwd / 'gti-toolchain.toml').write_text('[toolchain]\nchannel = "stable"\n')
         self.lsp_component(); self.run_cli('update', 'lsp')
         self.assertEqual(self.state()['default'], 'nightly')
-        self.assertIn('lsp', self.state()['toolchains']['preview'])
+        self.assertIn('lsp', self.state()['toolchains']['stable'])
         self.assertNotIn('lsp', self.state()['toolchains']['nightly'])
 
     def test_all_channels_and_pinned_versions(self):
-        for tag in ('preview', 'nightly', 'v0.2.0', 'v0.3.0-beta.2', 'v0.1.0'): self.package(tag)
-        for channel in ('preview', 'nightly', 'beta', 'stable', '0.1.0', '0.3.0-beta.2'):
+        for tag in ('nightly', 'v0.2.0', 'v0.3.0-beta.2', 'v0.1.0'): self.package(tag)
+        for channel in ('nightly', 'beta', 'stable', '0.1.0', '0.3.0-beta.2'):
             self.run_cli('install', channel)
         state = self.state()
         self.assertEqual(state['toolchains']['stable']['tag'], 'v0.2.0')
         self.assertEqual(state['toolchains']['beta']['tag'], 'v0.3.0-beta.2')
-        self.assertEqual(len(state['toolchains']), 6)
-        self.assertIn('preview', self.run_cli('list').stdout)
+        self.assertEqual(len(state['toolchains']), 5)
+        self.assertIn('nightly', self.run_cli('list').stdout)
 
     def test_download_stages_are_on_stderr_without_terminal_controls(self):
-        self.package('preview')
-        raw = subprocess.run([TEST, 'default', 'preview'], cwd=self.cwd, env=self.env,
+        self.package('nightly')
+        raw = subprocess.run([TEST, 'default', 'nightly'], cwd=self.cwd, env=self.env,
                              capture_output=True, timeout=15)
         self.assertEqual(raw.returncode, 0, raw.stderr)
         self.assertNotIn(b'\r', raw.stderr); self.assertNotIn(b'\x1b', raw.stderr)
         stderr, stdout = raw.stderr.decode(), raw.stdout.decode()
-        stages = ('Checking preview release', 'Downloading preview', 'Downloaded preview',
-                  'Verifying archive checksum', 'Extracting preview', 'Verifying toolchain identity',
-                  'Activating preview')
+        stages = ('Checking nightly release', 'Downloading nightly', 'Downloaded nightly',
+                  'Verifying archive checksum', 'Extracting nightly', 'Verifying toolchain identity',
+                  'Activating nightly')
         for stage in stages:
             self.assertIn(stage, stderr)
         positions = [stderr.index(stage) for stage in stages]
         self.assertEqual(positions, sorted(positions))
-        self.assertTrue(stdout.startswith('Installed preview:'))
+        self.assertTrue(stdout.startswith('Installed nightly:'))
         self.assertNotIn('Downloading', stdout)
-        self.assertEqual(self.run_cli('default', 'preview').stderr, '')
+        self.assertEqual(self.run_cli('default', 'nightly').stderr, '')
 
     def test_live_terminal_progress_before_download_finishes(self):
         for unknown_size in (False, True):
             with self.subTest(unknown_size=unknown_size):
-                path = self.package('preview')
+                path = self.package('nightly')
                 release = threading.Event()
                 self.slow[path] = (release, unknown_size)
                 master, slave = pty.openpty()
-                process = subprocess.Popen([TEST, 'update', 'preview'], cwd=self.cwd, env=self.env,
+                process = subprocess.Popen([TEST, 'update', 'nightly'], cwd=self.cwd, env=self.env,
                                            stdout=subprocess.PIPE, stderr=slave)
                 os.close(slave)
                 output = b''
@@ -250,7 +376,7 @@ class Manager(unittest.TestCase):
                         if select.select([master], [], [], 0.2)[0]:
                             output += os.read(master, 8192)
                     self.assertIsNone(process.poll(), output)
-                    self.assertIn(b'Downloading preview', output)
+                    self.assertIn(b'Downloading nightly', output)
                     self.assertRegex(output, pattern)
                     self.assertNotIn(b'Installed', output)
                     if unknown_size:
@@ -260,53 +386,55 @@ class Manager(unittest.TestCase):
                     stdout, _ = process.communicate(timeout=10)
                     os.close(master)
                 self.assertEqual(process.returncode, 0, output)
-                self.assertIn(b'Installed preview', stdout)
+                self.assertIn(b'Installed nightly', stdout)
 
     def test_interrupted_download_never_reports_success(self):
-        path = self.package('preview')
+        path = self.package('nightly')
         self.routes[path] = (b'partial', 100)
-        result = self.run_cli('default', 'preview', ok=False)
-        self.assertIn('Downloading preview', result.stderr)
+        result = self.run_cli('default', 'nightly', ok=False)
+        self.assertIn('Downloading nightly', result.stderr)
         self.assertIn('download failed', result.stderr)
-        self.assertNotIn('Downloaded preview', result.stderr)
+        self.assertNotIn('Downloaded nightly', result.stderr)
         self.assertNotIn('Activating', result.stderr)
         self.assertNotIn('Installed', result.stdout)
         self.assertFalse((self.home / 'settings.json').exists())
 
     def test_selection_proxy_arguments_and_offline_resolution(self):
-        for tag in ('preview', 'nightly'): self.package(tag); self.run_cli('install', tag)
+        for tag in ('v0.2.0', 'nightly'): self.package(tag)
+        for channel in ('stable', 'nightly'): self.run_cli('install', channel)
         self.run_cli('default', 'nightly'); self.run_cli('self-install')
-        (self.cwd / 'gti-toolchain').write_text('preview\n'); nested = self.cwd / 'nested'; nested.mkdir()
-        self.assertIn('preview-', self.run_cli('which', 'gti', cwd=nested).stdout)
+        (self.cwd / 'gti-toolchain').write_text('stable\n'); nested = self.cwd / 'nested'; nested.mkdir()
+        self.assertIn('v0.2.0-', self.run_cli('which', 'gti', cwd=nested).stdout)
         self.assertIn('nightly-', self.run_cli('which', 'gti', cwd=nested, env={**self.env, 'GTIUP_TOOLCHAIN': 'nightly'}).stdout)
         before = len(self.requests)
         result = self.run_cli('+nightly', 'file with spaces.gti', '--help', binary=str(self.home / 'bin/gti'), cwd=nested)
         self.assertEqual(result.stdout, 'compiler\n<file with spaces.gti>\n<--help>\n')
-        self.assertIn('lsp', self.run_cli('run', 'preview', 'gti_lsp', '--version').stdout)
-        self.assertIn('preview', self.run_cli('show').stdout)
+        self.assertIn('lsp', self.run_cli('run', 'stable', 'gti_lsp', '--version').stdout)
+        self.assertIn('stable', self.run_cli('show').stdout)
         self.assertEqual(before, len(self.requests))
-        (self.cwd / 'gti-toolchain').write_text('nonsense')
+        (self.cwd / 'gti-toolchain').write_text('not a toolchain')
         self.assertIn('gti-toolchain: invalid TOML', self.run_cli('which', 'gti', ok=False).stderr)
 
     def test_toml_channels_and_versions(self):
-        for tag in ('preview', 'nightly', 'v0.2.0', 'v0.3.0-beta.2'): self.package(tag)
-        for channel in ('preview', 'nightly', 'beta', 'stable', '0.2.0', 'v0.3.0-beta.2'):
+        for tag in ('nightly', 'v0.2.0', 'v0.3.0-beta.2'): self.package(tag)
+        for channel in ('nightly', 'beta', 'stable', '0.2.0', 'v0.3.0-beta.2'):
             self.run_cli('install', channel)
             (self.cwd / 'gti-toolchain.toml').write_text(f'# Project pin\n[toolchain]\nchannel = "{channel}" # comment\n')
             expected = 'v0.2.0' if channel == '0.2.0' else channel
             self.assertEqual(self.run_cli('show').stdout.splitlines()[0], expected)
 
     def test_toml_precedence_and_proxies(self):
-        for tag in ('preview', 'nightly'): self.package(tag); self.run_cli('install', tag)
+        for tag in ('v0.2.0', 'nightly'): self.package(tag)
+        for channel in ('stable', 'nightly'): self.run_cli('install', channel)
         self.run_cli('default', 'nightly'); self.run_cli('self-install')
         (self.cwd / 'gti-toolchain').write_text('nightly\n')
         child = self.cwd / 'child'; child.mkdir()
         nested = child / 'nested'; nested.mkdir()
         config = child / 'gti-toolchain.toml'
-        config.write_text("[toolchain]\r\nchannel = 'preview'\r\n")
+        config.write_text("[toolchain]\r\nchannel = 'stable'\r\n")
         before = len(self.requests)
         for tool in ('gti', 'gti_lsp'):
-            self.assertIn('preview-', self.run_cli('which', tool, cwd=nested).stdout)
+            self.assertIn('v0.2.0-', self.run_cli('which', tool, cwd=nested).stdout)
             self.assertIn('nightly-', self.run_cli('which', tool, cwd=nested, env={**self.env, 'GTIUP_TOOLCHAIN': 'nightly'}).stdout)
             result = self.run_cli('argument with spaces', binary=str(self.home / 'bin' / tool), cwd=nested)
             self.assertIn('<argument with spaces>', result.stdout)
@@ -314,8 +442,8 @@ class Manager(unittest.TestCase):
         (child / 'gti-toolchain').write_text('nightly\n')
         config.write_text('invalid')
         self.assertEqual(self.run_cli('show', cwd=nested).stdout.splitlines()[0], 'nightly')
-        (child / 'gti-toolchain').write_text('[toolchain]\nchannel = "preview"\n')
-        self.assertEqual(self.run_cli('show', cwd=nested).stdout.splitlines()[0], 'preview')
+        (child / 'gti-toolchain').write_text('[toolchain]\nchannel = "stable"\n')
+        self.assertEqual(self.run_cli('show', cwd=nested).stdout.splitlines()[0], 'stable')
         (child / 'gti-toolchain').unlink()
         # Explicit selections bypass a broken project configuration.
         self.run_cli('+nightly', '--version', binary=str(self.home / 'bin/gti'), cwd=nested)
@@ -348,9 +476,11 @@ class Manager(unittest.TestCase):
             config.write_text(f'[toolchain]\nchannel = "nightly"\n{field} = "value"')
             self.assertIn('unsupported toolchain setting: ' + field, self.run_cli('show', ok=False).stderr)
         config.write_text('[toolchain]\nchannel = "preview"')
-        self.assertIn('preview is not installed', self.run_cli('show', ok=False).stderr)
+        self.assertIn('preview is retired and not installed', self.run_cli('show', ok=False).stderr)
+        config.write_text('[toolchain]\nchannel = "dev"')
+        self.assertIn(str(config) + ': no linked toolchain named dev', self.run_cli('show', ok=False).stderr)
         # A broken legacy file must not fall through to the valid TOML sibling.
-        (self.cwd / 'gti-toolchain').write_text('broken')
+        (self.cwd / 'gti-toolchain').write_text('broken file')
         self.assertIn('gti-toolchain: invalid TOML', self.run_cli('show', ok=False).stderr)
         self.assertEqual(before, len(self.requests))
 
@@ -385,11 +515,9 @@ class Manager(unittest.TestCase):
         self.routes[expected + '.sha256'] = (hashlib.sha256(self.routes[asset]).hexdigest() + '  ' + expected.rsplit('/', 1)[1]).encode()
         self.assertIn('version mismatch', self.run_cli('install', 'stable', ok=False).stderr)
 
-    def test_required_tool_and_preview_identity(self):
+    def test_required_tool(self):
         self.package(missing='bin/gti_lsp')
         self.assertIn('lacks executable', self.run_cli('install', 'nightly', ok=False).stderr)
-        self.package('preview', missing='share/gti/preview.json')
-        self.run_cli('install', 'preview', ok=False)
         self.assertFalse((self.home / 'settings.json').exists())
 
     def test_archive_paths_links_duplicates_and_special_files(self):
@@ -444,7 +572,7 @@ class Manager(unittest.TestCase):
         return {name: (self.home / name).read_bytes() if (self.home / name).exists() else None for name in files}
 
     def test_self_update_preserves_toolchains_proxies_and_settings(self):
-        self.package('preview'); self.run_cli('default', 'preview')
+        self.package('nightly'); self.run_cli('default', 'nightly')
         binary = self.installed_manager()
         (self.home / 'env').write_text('user shell settings')
         before = self.manager_snapshot()
@@ -560,15 +688,15 @@ class Manager(unittest.TestCase):
         unmanaged = self.home / 'toolchains/user-files'; unmanaged.mkdir()
         self.run_cli('gc'); self.assertFalse(Path(old).exists()); self.assertTrue(unmanaged.exists())
         self.run_cli('uninstall','nightly',ok=False)
-        self.package('preview'); self.run_cli('default','preview'); self.run_cli('uninstall','nightly')
+        self.package('v0.2.0'); self.run_cli('default','stable'); self.run_cli('uninstall','nightly')
         self.assertNotIn('nightly',self.state()['toolchains'])
 
     def test_concurrent_installs_do_not_lose_selections(self):
-        self.package('nightly'); self.package('preview')
-        processes = [subprocess.Popen([TEST,'install',s],cwd=self.cwd,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for s in ('nightly','preview')]
+        self.package('nightly'); self.package('v0.2.0')
+        processes = [subprocess.Popen([TEST,'install',s],cwd=self.cwd,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for s in ('nightly','stable')]
         for p in processes:
             stdout,stderr=p.communicate(timeout=20); self.assertEqual(p.returncode,0,stderr)
-        self.assertEqual(set(self.state()['toolchains']),{'nightly','preview'})
+        self.assertEqual(set(self.state()['toolchains']),{'nightly','stable'})
 
     def test_production_binary_has_no_test_endpoint_override(self):
         # An invalid channel fails before a network request on either binary.

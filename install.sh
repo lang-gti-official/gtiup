@@ -11,7 +11,7 @@ modify_path=true
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --help|-h)
-      echo 'Usage: install.sh [--default-toolchain preview|nightly|beta|stable|VERSION|none] [--no-modify-path]'
+      echo 'Usage: install.sh [--default-toolchain nightly|beta|stable|VERSION|none] [--no-modify-path]'
       echo 'Installs nightly by default and configures PATH for bash, zsh and sh.'
       echo 'GTIUP_HOME selects the install directory (default ~/.gtiup).'
       echo 'GTIUP_VERSION=vX.Y.Z pins the manager download; default is latest.'
@@ -23,7 +23,10 @@ while [ "$#" -gt 0 ]; do
     *) echo 'gtiup: use --help for installer arguments' >&2; exit 1 ;;
   esac
 done
-printf '%s\n' "$toolchain" | grep -Eq '^(preview|nightly|beta|stable|none|[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?)$' || {
+if [ "$toolchain" = preview ]; then
+  echo 'gtiup: the preview channel is retired and no longer published; use --default-toolchain nightly' >&2; exit 1
+fi
+printf '%s\n' "$toolchain" | grep -Eq '^(nightly|beta|stable|none|[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?)$' || {
   echo 'gtiup: invalid toolchain selection' >&2; exit 1;
 }
 command -v curl >/dev/null 2>&1 || { echo 'gtiup: installer requires curl' >&2; exit 1; }

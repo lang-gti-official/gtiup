@@ -51,10 +51,17 @@ else: dest.write_bytes(payload)
         return p
 
     def test_default_and_argument_forwarding(self):
-        self.run_install('--default-toolchain','preview')
-        self.assertEqual(self.called.read_text().splitlines(),['self-install','--default-toolchain','preview'])
+        self.run_install('--default-toolchain','beta')
+        self.assertEqual(self.called.read_text().splitlines(),['self-install','--default-toolchain','beta'])
         self.assertTrue(all('/releases/latest/download/' in x for x in self.urls.read_text().splitlines()))
         self.assertEqual((Path(self.env['GTIUP_HOME'])/'share/gtiup/licenses.txt').read_text(),'fixture license')
+
+    def test_retired_preview_is_refused_before_download(self):
+        result=self.run_install('--default-toolchain','preview',ok=False)
+        self.assertIn('preview channel is retired',result.stderr)
+        self.assertIn('nightly',result.stderr)
+        self.assertFalse(self.called.exists())
+        self.assertFalse(self.urls.exists())
 
     def test_pinned_manager_and_manager_only(self):
         self.run_install('--default-toolchain','none',GTIUP_VERSION='v0.1.0')

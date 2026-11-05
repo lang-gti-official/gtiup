@@ -2,7 +2,8 @@
 
 A standalone C++ toolchain manager for [GTI](https://github.com/lang-gti-official/gti).
 Install and select matching compiler, LSP, standard library, runtime and parser
-from **preview**, **nightly**, **beta**, **stable**, or a pinned published version.
+from **nightly**, **beta**, **stable**, a pinned published version, or a local
+build you link. The former **preview** channel is retired.
 
 The manager has its own builds, tests, version numbers and GitHub downloads.
 It does not build GTI or LLVM. Installing or running the released manager needs
@@ -25,11 +26,11 @@ add duplicate PATH entries. No sudo is required.
 Choose another channel during installation:
 
 ```sh
-curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s -- --default-toolchain preview
+curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s -- --default-toolchain beta
 ```
 
-Use `nightly`, `beta`, `stable`, or an explicit published version in place of
-`preview`. Unpublished channels fail clearly instead of falling back. Use
+Use `nightly`, `stable`, or an explicit published version in place of
+`beta`. Unpublished channels fail clearly instead of falling back. Use
 `--default-toolchain none` for manager-only installation, and `--no-modify-path`
 to manage shell configuration yourself (also for shells other than bash/zsh/sh).
 The script creates `~/.gtiup/env`, sources it from `.profile` and the selected
@@ -86,7 +87,6 @@ curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s
 
 ```sh
 gtiup default nightly
-gtiup install preview
 gtiup install beta
 gtiup install stable
 gtiup install 0.12.0          # a published immutable stable version
@@ -94,7 +94,7 @@ gtiup install 0.13.0-beta.2  # a published beta version
 gtiup update nightly
 gtiup list
 gtiup show
-gti +preview build
+gti +beta build
 gtiup run nightly gti_lsp --version
 gtiup which gti_lsp
 ```
@@ -122,7 +122,8 @@ This requires a toolchain containing the new LSP compatibility metadata. Older
 toolchains need a complete `gtiup update <channel>` first. The component must
 match the selected compiler, standard library, runtime and parser inputs exactly;
 it must also be at least as new in source ancestry as the installed LSP. An
-unmerged preview with a newer or divergent adapter keeps its current LSP.
+published LSP whose source is older than or diverges from the installed one is
+refused; the toolchain keeps its current LSP.
 Missing compatible components leave the selection unchanged.
 
 The manager downloads and verifies the component, then atomically activates a
@@ -142,8 +143,8 @@ With gtiup 0.2.0 or later, put a `gti-toolchain.toml` file in your project:
 channel = "nightly"
 ```
 
-`channel` accepts `preview`, `nightly`, `beta`, `stable`, or a published pinned
-version such as `0.3.0-beta.2`. Comments and standard TOML string syntax work.
+`channel` accepts `nightly`, `beta`, `stable`, a published pinned version such
+as `0.3.0-beta.2`, or the name of a linked toolchain. Comments and standard TOML string syntax work.
 Only `toolchain.channel` is supported: settings such as Rustup's `components`,
 `targets`, `profile`, or `path` are rejected rather than silently ignored.
 
@@ -168,13 +169,43 @@ Updates and uninstall retain immutable old directories for running compiler/LSP
 processes. Close those processes before explicitly running `gtiup gc` to reclaim
 unreferenced toolchains. Unmanaged directories are retained.
 
+## Use a local build
+
+With gtiup 0.5.0 or later, register a GTI build you installed yourself as a
+named toolchain, like `rustup toolchain link`:
+
+```sh
+cmake --install build --prefix ~/.local/gti-dev   # in a GTI compiler checkout
+gtiup link dev ~/.local/gti-dev
+gtiup default dev           # or: gti +dev, gtiup run dev gti_lsp, gti-toolchain
+gtiup which gti             # ~/.local/gti-dev/bin/gti
+gtiup unlink dev            # forget the link; the prefix is not touched
+```
+
+The prefix must contain an executable `bin/gti`, and `bin/gti_lsp` if it has
+one, as regular files inside the prefix so the compiler finds its own
+`share/gti` resources. A name starts with a letter and uses letters, digits,
+`.`, `_` or `-`; channel and version names are reserved. A linked toolchain is
+selected like any other (`gtiup default`, `gti +NAME`, `gtiup run`,
+`GTIUP_TOOLCHAIN`, project files), and is used in place: reinstall into the
+prefix to update it. gtiup never downloads, updates, garbage-collects or deletes
+a linked toolchain; `install`, `update` and `uninstall` refuse its name. Running
+`gtiup link` again with the same name replaces the prefix.
+
+## Retired preview channel
+
+The preview channel is no longer published. `gtiup install preview`,
+`gtiup update preview` and `--default-toolchain preview` fail with a message
+suggesting `nightly`; gtiup never silently installs another channel instead. A
+preview installed by an earlier gtiup keeps working through `gtiup default`,
+`gti +preview` and project files until you `gtiup uninstall preview`.
+
 ## Channels and trust
 
 Compiler archives come from `lang-gti-official/gti`; manager binaries come from
-`lang-gti-official/gtiup`. These are independent release lifecycles. Preview is
-an early combined toolchain and retains its inclusion manifest; it is not a
-nightly/stable qualification. The manager validates SHA256, archive paths and
-entry types, rolling source identity, preview metadata, version identity and
+`lang-gti-official/gtiup`. These are independent release lifecycles. The
+manager validates SHA256, archive paths and entry types, rolling source
+identity, version identity and
 release revocations before atomically changing a selection. A failed update
 preserves the current selection.
 
@@ -217,4 +248,4 @@ To release: update the CMake project version through a PR, let gtiup CI pass,
 and tag that exact commit `vX.Y.Z`. The tag workflow rebuilds/tests the small
 manager, checks both platform inventories, generates provenance and creates an
 immutable GitHub release. Existing releases are never overwritten. Toolchain
-preview/nightly/beta/stable publication stays in the compiler repository.
+nightly/beta/stable publication stays in the compiler repository.
