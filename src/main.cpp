@@ -835,9 +835,10 @@ struct Manager {
     std::cout << "Unlinked " << name << "; " << prefix << " is unchanged\n";
   }
   // A short, readable name for an installed build: a rolling channel's
-  // commit is abbreviated; a versioned release is its version.
-  static std::string build_label(const std::string &identity) {
-    return std::regex_match(identity, sha_pattern) ? identity.substr(0, 7) : identity;
+  // commit is abbreviated (in full with --verbose); a versioned release is
+  // its version.
+  static std::string build_label(const std::string &identity, bool full = false) {
+    return std::regex_match(identity, sha_pattern) && !full ? identity.substr(0, 7) : identity;
   }
   static std::string version_note(const std::string &before, const std::string &after) {
     if (after.empty())
@@ -857,7 +858,8 @@ struct Manager {
     return urls.downloads.substr(0, urls.downloads.size() - suffix.size()) +
            "/compare/" + from + "..." + to;
   }
-  void install(const std::string &requested, bool set_default = false) {
+  void install(const std::string &requested, bool set_default = false,
+               bool verbose = false) {
     auto channel = installable(requested);
     status("Checking " + channel + " release...");
     Lock lock(home);
@@ -898,7 +900,7 @@ struct Manager {
         save(s);
       }
       std::cout << channel << " is already up to date: "
-                << build_label(previous.value("identity", ""))
+                << build_label(previous.value("identity", ""), verbose)
                 << version_note("", previous.value("version", "")) << '\n';
       return;
     }
@@ -951,19 +953,20 @@ struct Manager {
     const auto before = previous.is_null() ? std::string() : previous.value("identity", "");
     const auto before_version = previous.is_null() ? std::string() : previous.value("version", "");
     if (before.empty()) {
-      std::cout << "Installed " << channel << ": " << build_label(identity)
+      std::cout << "Installed " << channel << ": " << build_label(identity, verbose)
                 << version_note("", packaged_version) << '\n';
     } else if (before == identity) {
-      std::cout << "Reinstalled " << channel << ": " << build_label(identity)
+      std::cout << "Reinstalled " << channel << ": " << build_label(identity, verbose)
                 << (previous.contains("lsp") ? " (same build; restored its bundled LSP)"
                                              : " (same build)")
                 << '\n';
     } else {
-      std::cout << "Updated " << channel << ": " << build_label(before) << " -> "
-                << build_label(identity) << version_note(before_version, packaged_version)
-                << '\n';
+      std::cout << "Updated " << channel << ": " << build_label(before, verbose) << " -> "
+                << build_label(identity, verbose)
+                << version_note(before_version, packaged_version) << '\n';
       const auto link = rolling(rel.tag) && std::regex_match(before, sha_pattern)
-                            ? compare_url(before, identity) : std::string();
+                            ? compare_url(build_label(before, verbose), build_label(identity, verbose))
+                            : std::string();
       if (!link.empty())
         std::cout << "Changes: " << link << '\n';
     }
@@ -1287,7 +1290,8 @@ void help() {
   std::cout << "gtiup " GTIUP_VERSION " — GTI toolchain manager\n"
             << "  self-install [--default-toolchain CHANNEL|none]\n"
             << "  self update\n"
-            << "  install|update|uninstall CHANNEL\n"
+            << "  install|update [-v|--verbose] CHANNEL\n"
+            << "  uninstall CHANNEL\n"
             << "  default CHANNEL|NAME\n"
             << "  link NAME PREFIX | unlink NAME\n"
             << "  update lsp [CHANNEL]\n"
@@ -1347,11 +1351,25 @@ int main(int argc, char **argv) {
       manager.update_lsp(args.size() == 3 ? args[2] : "");
     } else if (command == "install" || command == "update" ||
                command == "default" || command == "uninstall") {
+      // install and update accept -v/--verbose to name nightly builds by
+      // their full commit instead of the abbreviated one.
+      bool verbose = false;
+      if (command == "install" || command == "update") {
+        auto flag = std::find_if(args.begin() + 1, args.end(), [](const std::string &a) {
+          return a == "-v" || a == "--verbose";
+        });
+        if (flag != args.end()) {
+          verbose = true;
+          args.erase(flag);
+        }
+      }
       if (args.size() != 2)
-        throw Error("usage: gtiup " + command + " CHANNEL");
+        throw Error("usage: gtiup " + command +
+                    (command == "install" || command == "update" ? " [-v|--verbose]" : "") +
+                    " CHANNEL");
       auto channel = selection(args[1]);
       if (command == "install" || command == "update")
-        manager.install(channel);
+        manager.install(channel, false, verbose);
       else if (command == "default") {
         if (!manager.state()["toolchains"].contains(channel)) {
           if (linked_name(channel))

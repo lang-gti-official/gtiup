@@ -105,13 +105,14 @@ channel, on stdout:
 ```text
 Installed nightly: efde87a (GTI 0.493.3)
 Updated nightly: d500c18 -> efde87a (GTI 0.493.3)
-Changes: https://github.com/lang-gti-official/gti/compare/d500c18f95409c1608d292663f818da0556b6891...efde87ac687024cbc3f7182244e0b658f57e69f8
+Changes: https://github.com/lang-gti-official/gti/compare/d500c18...efde87a
 nightly is already up to date: efde87a (GTI 0.493.3)
 Updated stable: 0.12.0 -> 0.13.0 (GTI 0.12.0 -> 0.13.0)
 ```
 
 A nightly is named by its abbreviated source commit and a beta or stable
-release by its version. When the published archive's checksum matches the
+release by its version. `gtiup update -v nightly` (or `--verbose`) prints full
+commits instead. When the published archive's checksum matches the
 installed one, the update stops after that small check and downloads nothing.
 A toolchain whose LSP was updated separately, or whose files are missing, is
 reinstalled instead and reported as `Reinstalled ... (same build)`.

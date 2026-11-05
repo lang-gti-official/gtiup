@@ -501,6 +501,18 @@ class Manager(unittest.TestCase):
         result = self.run_cli('update', 'nightly')
         self.assertEqual(result.stdout.splitlines()[0], 'Updated nightly: aaaaaaa -> bbbbbbb (GTI 0.1.0 -> 0.2.0)')
         self.assertNotIn('Changes:', result.stdout, 'test endpoints have no compare page')
+        # --verbose (or -v) names nightly builds by their full commit.
+        self.package(identity='c' * 40, version='0.2.0')
+        self.routes['/downloads/nightly/BUILD_ID'] = ('c' * 40).encode()
+        self.assertEqual(self.run_cli('update', '--verbose', 'nightly').stdout.splitlines()[0],
+                         'Updated nightly: ' + 'b' * 40 + ' -> ' + 'c' * 40 + ' (GTI 0.2.0)')
+        self.assertEqual(self.run_cli('update', 'nightly', '-v').stdout,
+                         'nightly is already up to date: ' + 'c' * 40 + ' (GTI 0.2.0)\n')
+        self.assertIn('usage: gtiup update [-v|--verbose] CHANNEL',
+                      self.run_cli('update', '-v', ok=False).stderr)
+        self.package(identity='b' * 40, version='0.2.0')
+        self.routes['/downloads/nightly/BUILD_ID'] = ('b' * 40).encode()
+        self.run_cli('update', 'nightly')
         # A versioned channel reports versions.
         self.package('v0.1.0'); self.routes['/status']['stable'] = ['0.1.0']
         self.assertEqual(self.run_cli('install', 'stable').stdout, 'Installed stable: 0.1.0 (GTI 0.1.0)\n')
