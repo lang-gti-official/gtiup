@@ -99,6 +99,24 @@ gtiup run nightly gti_lsp --version
 gtiup which gti_lsp
 ```
 
+The last line of `gtiup install` or `gtiup update` says what changed on that
+channel, on stdout:
+
+```text
+Installed nightly: efde87a (GTI 0.493.3)
+Updated nightly: d500c18 -> efde87a (GTI 0.493.3)
+Changes: https://github.com/lang-gti-official/gti/compare/d500c18...efde87a
+nightly is already up to date: efde87a (GTI 0.493.3)
+Updated stable: 0.12.0 -> 0.13.0 (GTI 0.12.0 -> 0.13.0)
+```
+
+A nightly is named by its abbreviated source commit and a beta or stable
+release by its version. `gtiup update -v nightly` (or `--verbose`) prints full
+commits instead. When the published archive's checksum matches the
+installed one, the update stops after that small check and downloads nothing.
+A toolchain whose LSP was updated separately, or whose files are missing, is
+reinstalled instead and reported as `Reinstalled ... (same build)`.
+
 Versions above illustrate syntax, not a promise that those releases exist.
 Channels that have not been published fail clearly. A yanked stable or withdrawn
 beta is refused; the manager never silently substitutes another release.

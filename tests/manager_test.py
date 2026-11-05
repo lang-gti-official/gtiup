@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import io
 import json
+import shutil
 import os
 from pathlib import Path
 import platform
@@ -386,7 +387,8 @@ class Manager(unittest.TestCase):
                     stdout, _ = process.communicate(timeout=10)
                     os.close(master)
                 self.assertEqual(process.returncode, 0, output)
-                self.assertIn(b'Installed nightly', stdout)
+                # The second pass republishes the same build as a new archive.
+                self.assertRegex(stdout, rb'^(Installed|Reinstalled) nightly: aaaaaaa')
 
     def test_interrupted_download_never_reports_success(self):
         path = self.package('nightly')
@@ -484,12 +486,56 @@ class Manager(unittest.TestCase):
         self.assertIn('gti-toolchain: invalid TOML', self.run_cli('show', ok=False).stderr)
         self.assertEqual(before, len(self.requests))
 
+    def test_update_reports_what_changed(self):
+        asset = self.package()
+        self.assertEqual(self.run_cli('install', 'nightly').stdout, 'Installed nightly: aaaaaaa (GTI 0.1.0)\n')
+        self.assertEqual(self.state()['toolchains']['nightly']['version'], '0.1.0')
+        # Unchanged: the small checksum decides, and the archive is not fetched again.
+        before = list(self.requests)
+        result = self.run_cli('update', 'nightly')
+        self.assertEqual(result.stdout, 'nightly is already up to date: aaaaaaa (GTI 0.1.0)\n')
+        self.assertNotIn(asset, self.requests[len(before):])
+        # A newer build says where it came from and where it went.
+        self.package(identity='b' * 40, version='0.2.0')
+        self.routes['/downloads/nightly/BUILD_ID'] = ('b' * 40).encode()
+        result = self.run_cli('update', 'nightly')
+        self.assertEqual(result.stdout.splitlines()[0], 'Updated nightly: aaaaaaa -> bbbbbbb (GTI 0.1.0 -> 0.2.0)')
+        self.assertNotIn('Changes:', result.stdout, 'test endpoints have no compare page')
+        # --verbose (or -v) names nightly builds by their full commit.
+        self.package(identity='c' * 40, version='0.2.0')
+        self.routes['/downloads/nightly/BUILD_ID'] = ('c' * 40).encode()
+        self.assertEqual(self.run_cli('update', '--verbose', 'nightly').stdout.splitlines()[0],
+                         'Updated nightly: ' + 'b' * 40 + ' -> ' + 'c' * 40 + ' (GTI 0.2.0)')
+        self.assertEqual(self.run_cli('update', 'nightly', '-v').stdout,
+                         'nightly is already up to date: ' + 'c' * 40 + ' (GTI 0.2.0)\n')
+        self.assertIn('usage: gtiup update [-v|--verbose] CHANNEL',
+                      self.run_cli('update', '-v', ok=False).stderr)
+        self.package(identity='b' * 40, version='0.2.0')
+        self.routes['/downloads/nightly/BUILD_ID'] = ('b' * 40).encode()
+        self.run_cli('update', 'nightly')
+        # A versioned channel reports versions.
+        self.package('v0.1.0'); self.routes['/status']['stable'] = ['0.1.0']
+        self.assertEqual(self.run_cli('install', 'stable').stdout, 'Installed stable: 0.1.0 (GTI 0.1.0)\n')
+        self.package('v0.2.0'); self.routes['/status']['stable'] = ['0.1.0', '0.2.0']
+        self.assertEqual(self.run_cli('update', 'stable').stdout, 'Updated stable: 0.1.0 -> 0.2.0 (GTI 0.1.0 -> 0.2.0)\n')
+        self.assertIn('already up to date: 0.2.0', self.run_cli('update', 'stable').stdout)
+        # Records written before versions were stored still compare builds.
+        state = self.state(); del state['toolchains']['nightly']['version']
+        (self.home / 'settings.json').write_text(json.dumps(state))
+        self.assertEqual(self.run_cli('update', 'nightly').stdout, 'nightly is already up to date: bbbbbbb\n')
+        # A missing toolchain directory reinstalls the same build.
+        shutil.rmtree(self.home / 'toolchains' / self.state()['toolchains']['nightly']['directory'])
+        self.assertEqual(self.run_cli('update', 'nightly').stdout, 'Reinstalled nightly: bbbbbbb (same build)\n')
+        self.assertIn('compiler', self.run_cli('run', 'nightly', 'gti').stdout)
+
     def test_update_failure_keeps_previous_selection(self):
         self.package(); self.run_cli('default', 'nightly'); before = self.state()
         self.package(identity='b' * 40)
         self.assertIn('changed during download', self.run_cli('update', 'nightly', ok=False).stderr)
         self.assertEqual(self.state(), before)
-        asset = self.package(); self.routes[asset] = b'corrupted'
+        # A new build whose download is corrupted (an unchanged checksum would
+        # be reported as already up to date without downloading).
+        asset = self.package(version='0.9.0'); self.routes[asset] = b'corrupted'
         self.assertIn('checksum mismatch', self.run_cli('update', 'nightly', ok=False).stderr)
         self.assertEqual(self.state(), before)
         self.assertFalse(list((self.home / 'toolchains').glob('.gtiup-*')))
