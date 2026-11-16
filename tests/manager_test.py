@@ -75,7 +75,7 @@ class Manager(unittest.TestCase):
     def state(self): return json.loads((self.home / 'settings.json').read_text())
 
     def package(self, tag='nightly', identity=SHA, missing=None, extra=(), version=None, compatibility=None):
-        rolling = tag == 'nightly'
+        rolling = tag in ('nightly', 'tip')
         version = version or ('0.1.0' if rolling else tag[1:].split('-beta.')[0])
         stem = 'gti-' + tag if rolling else 'gti-v' + version
         asset = stem + '-' + HOST + '.tar.gz'
@@ -221,7 +221,7 @@ class Manager(unittest.TestCase):
 
     def test_link_validates_names_and_prefixes(self):
         prefix = self.local_prefix()
-        for name in ('nightly', 'preview', 'beta', 'stable', 'none', '0.1.0', 'v0.1.0', '0.2.0-beta.1',
+        for name in ('tip', 'nightly', 'preview', 'beta', 'stable', 'none', '0.1.0', 'v0.1.0', '0.2.0-beta.1',
                      '../dev', '-dev', '1dev', 'dev tools', ''):
             with self.subTest(name=name):
                 self.assertIn('invalid linked toolchain name', self.run_cli('link', name, str(prefix), ok=False).stderr)
@@ -329,6 +329,24 @@ class Manager(unittest.TestCase):
         self.assertEqual(self.state()['default'], 'nightly')
         self.assertIn('lsp', self.state()['toolchains']['stable'])
         self.assertNotIn('lsp', self.state()['toolchains']['nightly'])
+
+    def test_tip_is_a_rolling_channel_separate_from_nightly(self):
+        newer = 'b' * 40
+        self.package('nightly'); self.package('tip', identity=newer)
+        self.routes['/downloads/tip/BUILD_ID'] = newer.encode()
+        self.assertTrue(self.run_cli('install', 'tip').stdout.startswith('Installed tip: bbbbbbb'))
+        self.run_cli('install', 'nightly')
+        state = self.state()['toolchains']
+        self.assertEqual(state['tip']['tag'], 'tip')
+        self.assertNotEqual(state['tip']['directory'], state['nightly']['directory'])
+        self.assertTrue(state['tip']['directory'].startswith('tip-'))
+        self.assertIn('up to date', self.run_cli('update', 'tip').stdout)
+        self.assertEqual(self.run_cli('run', 'tip', 'gti').stdout.splitlines()[0], 'compiler')
+        # The archive's embedded identity must match the release's BUILD_ID.
+        self.package('tip', identity='c' * 40)
+        self.routes['/downloads/tip/BUILD_ID'] = ('d' * 40).encode()
+        self.run_cli('update', 'tip', ok=False)
+        self.assertEqual(self.state()['toolchains']['tip'], state['tip'])
 
     def test_all_channels_and_pinned_versions(self):
         for tag in ('nightly', 'v0.2.0', 'v0.3.0-beta.2', 'v0.1.0'): self.package(tag)

@@ -69,7 +69,8 @@ bool contains(const fs::path &root, const fs::path &path) {
 }
 const std::regex link_pattern("^[A-Za-z][A-Za-z0-9_.-]{0,63}$");
 bool is_channel(const std::string &s) {
-  return s == "preview" || s == "nightly" || s == "beta" || s == "stable";
+  return s == "preview" || s == "tip" || s == "nightly" || s == "beta" ||
+         s == "stable";
 }
 // A linked toolchain name never collides with a channel, a version or `none`.
 bool linked_name(const std::string &s) {
@@ -81,7 +82,7 @@ std::string release_selection(const std::string &s) {
   if (is_channel(s))
     return s;
   if (!std::regex_match(s, version_pattern))
-    throw Error("expected nightly, beta, stable, or X.Y.Z[-beta.N]");
+    throw Error("expected tip, nightly, beta, stable, or X.Y.Z[-beta.N]");
   return s[0] == 'v' ? s : "v" + s;
 }
 // Anything a command or project can select: a release or a linked toolchain.
@@ -89,7 +90,7 @@ std::string selection(const std::string &s) {
   if (linked_name(s))
     return s;
   if (!is_channel(s) && !std::regex_match(s, version_pattern))
-    throw Error("expected nightly, beta, stable, X.Y.Z[-beta.N], or a linked "
+    throw Error("expected tip, nightly, beta, stable, X.Y.Z[-beta.N], or a linked "
                 "toolchain name");
   return release_selection(s);
 }
@@ -109,7 +110,12 @@ std::string installable(const std::string &s) {
     throw Error(preview_retired);
   return channel;
 }
-bool rolling(const std::string &s) { return s == "preview" || s == "nightly"; }
+// Rolling channels republish one release per source commit and are told apart
+// by BUILD_ID. Tip is the newest packaged main commit, before the complete
+// suite has run; nightly is the newest commit that passed it.
+bool rolling(const std::string &s) {
+  return s == "preview" || s == "tip" || s == "nightly";
+}
 std::string project_selection(const fs::path &path, bool legacy) {
   try {
     const auto contents = read(path, 64 * 1024);
@@ -1297,7 +1303,7 @@ void help() {
             << "  update lsp [CHANNEL]\n"
             << "  list | show | which gti|gti_lsp | gc\n"
             << "  run CHANNEL|NAME gti|gti_lsp [ARGS...]\n"
-            << "Channels: nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N "
+            << "Channels: tip, nightly, beta, stable, X.Y.Z, X.Y.Z-beta.N "
                "(preview is retired)\n"
             << "Linked toolchains: an existing install prefix registered with "
                "gtiup link; never updated or deleted by gtiup\n"
@@ -1436,7 +1442,7 @@ int main(int argc, char **argv) {
           active.insert(entry.at("directory").get<std::string>());
       auto store = manager.home / "toolchains";
       const std::regex managed(
-          R"(^(preview|nightly|v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?)-[0-9a-f]{64}$)");
+          R"(^(preview|tip|nightly|v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?)-[0-9a-f]{64}$)");
       if (fs::exists(store))
         for (const auto &p : fs::directory_iterator(store))
           if (!p.is_symlink() && p.is_directory() &&
