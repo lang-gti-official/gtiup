@@ -2,8 +2,8 @@
 
 A standalone C++ toolchain manager for [GTI](https://github.com/lang-gti-official/gti).
 Install and select matching compiler, LSP, standard library, runtime and parser
-from **nightly**, **beta**, **stable**, a pinned published version, or a local
-build you link. The former **preview** channel is retired.
+from **tip**, **nightly**, **beta**, **stable**, a pinned published version, or
+a local build you link. The former **preview** channel is retired.
 
 The manager has its own builds, tests, version numbers and GitHub downloads.
 It does not build GTI or LLVM. Installing or running the released manager needs
@@ -87,6 +87,7 @@ curl -fsSL https://gtireference.internal.howetotech.dev/gtiup/install.sh | sh -s
 
 ```sh
 gtiup default nightly
+gtiup install tip             # newest packaged main commit; complete suite not yet run
 gtiup install beta
 gtiup install stable
 gtiup install 0.12.0          # a published immutable stable version

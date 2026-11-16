@@ -19,7 +19,7 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-24.04
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
@@ -40,6 +40,9 @@ jobs:
         run: docker run --rm -v "$PWD:/work" -w /work alpine:3.23 sh scripts/linux-static.sh
       - name: Build and test macOS manager
         if: matrix.platform == 'darwin-arm64'
+        env:
+          # The macos-14 image is retired; keep the manager's macOS 14 floor.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           test "$(uname -m)" = arm64
           cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release

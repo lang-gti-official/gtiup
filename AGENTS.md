@@ -10,7 +10,7 @@ changes. User authorization is required for installing into their real environme
 Temporary test homes and fixtures are appropriate validation.
 
 Keep the published binary independent of Python and the GTI compiler. Preserve
-nightly, beta, stable, explicit-version and linked-toolchain selection (the
+tip, nightly, beta, stable, explicit-version and linked-toolchain selection (the
 retired preview channel is refused, not substituted); atomic activation;
 checksum/source/version checks; safe archive extraction; revocation failures;
 and project-aware compiler/LSP proxies. Test failure paths, not only success.
